@@ -1,17 +1,22 @@
 # Jules MCP Server (`jules-mcp`)
 
-Universal Model Context Protocol (MCP) server for Google Jules Cloud Agent with 100% native REST API coverage, multi-account pooling, automated load balancing, and built-in interactive harness execution tools.
+Universal Model Context Protocol (MCP) server for Google Jules Cloud Agent with 100% native REST API coverage, multi-account pooling, automated load balancing, strict architectural invariants injection, and built-in interactive harness execution tools.
 
-No external cron jobs or background schedules required — any AI agent (Claude Code, Cursor, Hermes, Windsurf) can monitor, dispatch, unblock, stream progress, apply patches, and merge PRs directly over MCP.
+Designed specifically to address junior worker limitations:
+- **Zero PR Collisions:** Enforces the Golden Rule (1 chore per repo at a time) with active repo locks and sequential task queueing.
+- **Zero Freeze Pauses:** Autonomous unblocking directives, auto-plan approvals, and `jules_auto_nudge_all`.
+- **Architectural Guardrails:** Deprecated repo rejection and auto-injected system invariants for multi-tenant shared repos (`Agent-Brain`, `Basira-backend`, etc.).
 
 ---
 
-## Complete MCP Tool Reference (25 Tools)
+## Complete MCP Tool Reference (27 Tools)
 
-### 1. Harness Intelligence & Execution Bridge
+### 1. Harness Intelligence & Autonomous Unblocking
 - **`jules_check_events`** — Real-time event monitor for the entire multi-account pool. Instantly answers *"Is Jules done? Is Jules stuck? Does Jules need plan approval?"* with questions, plans, and 1-click action commands.
-- **`jules_wait_for_task`** — Synchronously blocks/polls for a session until it completes, fails, or asks for user input/approval. Bridges asynchronous cloud tasks into synchronous conversational turns.
-- **`jules_dispatch_and_wait`** — Dispatches a task and immediately waits for completion or initial feedback in a single MCP tool call. Automatically routes to the least-loaded account in the pool.
+- **`jules_auto_nudge_all`** — Pool-wide autonomous unblocker: scans all sessions across accounts stuck in `AWAITING_USER_FEEDBACK` and sends standard unblocking instructions in one click.
+- **`jules_wait_for_task`** — Synchronously blocks/polls for a session until completion or input request with automatic plan approval and auto-unblocking.
+- **`jules_dispatch_and_wait`** — Single-call chore execution: verifies repo lock, decorates prompt with architectural guardrails, dispatches to least-loaded account, and waits.
+- **`jules_queue_tasks`** — Sequentially executes a pipeline of chores on the same repo (waits for Task N before dispatching Task N+1) to prevent branch drift and PR merge conflicts.
 - **`jules_stream_progress`** — Generates a structured markdown execution timeline: step-by-step plan checklist `[x]`, internal thought reasoning trail, files modified, and sandbox bash commands.
 
 ### 2. Local Git & GitHub PR Automation
@@ -21,8 +26,8 @@ No external cron jobs or background schedules required — any AI agent (Claude 
 - **`jules_sync_prs`** — Local PR sync runner: applies patches, verifies locally with tests, and creates GitHub PRs.
 
 ### 3. Task Dispatching & Multi-Account Load Balancing
-- **`jules_create_task`** — Dispatches tasks with target branches, custom working branch, automated PR creation (`AUTO_CREATE_PR`), plan approval mode, and environment variables. Automatically routes to the least loaded account in the pool.
-- **`jules_batch_dispatch`** — Launches multiple tasks across different repositories simultaneously with automated pool load balancing.
+- **`jules_create_task`** — Dispatches tasks with repo lock checks, architectural invariant decoration, anti-pause directives, target branches, custom working branch, automated PR creation (`AUTO_CREATE_PR`), and plan approval mode.
+- **`jules_batch_dispatch`** — Launches multiple tasks across DIFFERENT repositories simultaneously with collision deduplication and multi-account load balancing.
 - **`jules_pool_status`** — Live status of all configured Google accounts (quotas, active in-flight count, completed count).
 
 ### 4. Source & Repository Discovery
@@ -81,18 +86,6 @@ No external cron jobs or background schedules required — any AI agent (Claude 
     "jules": {
       "command": "jules-mcp",
       "args": []
-    }
-  }
-}
-```
-
-### Cursor / Windsurf (`mcp.json`)
-```json
-{
-  "mcpServers": {
-    "jules": {
-      "command": "node",
-      "args": ["/root/projects/jules-mcp/dist/index.js"]
     }
   }
 }

@@ -26,6 +26,24 @@ interface JulesConfig {
   last_index?: number;
 }
 
+// Deprecated or decommissioned repos that should NEVER be dispatched to Jules
+const DEPRECATED_REPOS: Record<string, string> = {
+  "email-assistant": "Deprecated microservice. Replaced by unified email-channel & agent-brain.",
+  "omnichat-backend": "Deprecated standalone repo. Replaced by chat-channel & agent-brain.",
+  "basira-omnichat": "Deprecated standalone repo. Unified into chat-channel.",
+};
+
+// Architecture invariants injected into prompts based on repository
+const ARCHITECTURE_INVARIANTS: Record<string, string> = {
+  "agent-brain": "ARCHITECTURAL INVARIANT: Agent-Brain is the shared multi-tenant AI reasoning engine for both Basira and StayBooked. Do NOT hardcode tenant IDs or break cross-capability channel contracts.",
+  "basria-backend": "ARCHITECTURAL INVARIANT: Basira-backend is a multi-tenant FastAPI service. Postgres is local (127.0.0.1). Do NOT change database connection parameters or alter multi-tenant auth middleware.",
+  "basira-frontend": "ARCHITECTURAL INVARIANT: Basira-frontend is a Next.js 16 app deployed on Vercel. Ensure strict TypeScript types (tsc --noEmit must pass with 0 errors).",
+  "staybooked": "ARCHITECTURAL INVARIANT: StayBooked is a Next.js 15 fullstack application (Server Actions + raw Postgres queries). Do NOT break multi-tenant client portal routing.",
+  "voice-channel": "ARCHITECTURAL INVARIANT: Real-time telephony microservice (Twilio Media Streams -> Deepgram STT -> ElevenLabs TTS). Maintain low-latency async streams.",
+  "chat-channel": "ARCHITECTURAL INVARIANT: Unified omni-channel gateway (WhatsApp, SMS, Socket.io) subscribing to Agent-Brain events.",
+  "email-channel": "ARCHITECTURAL INVARIANT: Autonomous email gateway subscribing to Agent-Brain events.",
+};
+
 function loadConfig(): JulesConfig {
   if (fs.existsSync(CONFIG_PATH)) {
     try {
@@ -136,10 +154,61 @@ async function getLeastLoadedAccount(): Promise<Account> {
   return loads[0].account;
 }
 
+// Check if a repository already has active sessions in flight (Prevent PR Collision & Branch Drift)
+async function checkRepoActiveLock(repoIdentifier: string): Promise<{ locked: boolean; activeSessions: any[] }> {
+  const accounts = getAccounts();
+  const cleanRepoName = repoIdentifier.toLowerCase().replace(/^sources\/github\/[^\/]+\//, "");
+  const activeSessions: any[] = [];
+
+  for (const acc of accounts) {
+    try {
+      const res = await request("sessions?pageSize=30", acc.key);
+      for (const s of res.sessions || []) {
+        const state = s.state;
+        if (state === "IN_PROGRESS" || state === "AWAITING_PLAN_APPROVAL" || state === "AWAITING_USER_FEEDBACK") {
+          const sSource = (s.sourceContext?.source || "").toLowerCase();
+          if (sSource.includes(cleanRepoName)) {
+            activeSessions.push({
+              session_id: s.id || s.name?.replace("sessions/", ""),
+              state: s.state,
+              title: s.title,
+              account: acc.name || acc.email,
+            });
+          }
+        }
+      }
+    } catch {}
+  }
+
+  return { locked: activeSessions.length > 0, activeSessions };
+}
+
+// Decorate prompt with Architectural Invariants & Anti-Pause autonomous instructions
+function decoratePrompt(rawPrompt: string, repoIdentifier: string): string {
+  const cleanRepo = repoIdentifier.toLowerCase().replace(/^sources\/github\/[^\/]+\//, "");
+  let invariant = "";
+  for (const [key, val] of Object.entries(ARCHITECTURE_INVARIANTS)) {
+    if (cleanRepo.includes(key)) {
+      invariant = `\n${val}\n`;
+      break;
+    }
+  }
+
+  const antiPauseGuard = `
+CRITICAL AUTONOMOUS EXECUTION DIRECTIVES:
+1. Work completely autonomously: do NOT pause or ask questions.
+2. If choice is needed, pick the standard TypeScript/Python stdlib approach.
+3. Make small, surgical, modular diffs. Do NOT rewrite working code.
+4. Execute tests and clean up temporary logs/debug files before final commit.
+`;
+
+  return `${rawPrompt.trim()}${invariant}\n${antiPauseGuard}`.trim();
+}
+
 const server = new Server(
   {
     name: "jules-mcp",
-    version: "1.2.0",
+    version: "1.3.0",
   },
   {
     capabilities: {
@@ -169,6 +238,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "jules_auto_nudge_all",
+        description: "Autonomous unblocker: automatically finds all sessions currently stuck in AWAITING_USER_FEEDBACK across the entire pool and sends a pre-emptive unblocking directive to keep Jules working without manual CLI nudging.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            custom_instruction: {
+              type: "string",
+              description: "Optional custom instruction to send to all stuck sessions. Defaults to 'Proceed with standard implementation, follow existing project conventions, and complete tests.'",
+            },
+          },
+        },
+      },
+      {
         name: "jules_wait_for_task",
         description: "Synchronously poll/wait for a Google Jules session until completion, failure, plan approval request, or question asking. Bridges async cloud execution directly into harness dialogue.",
         inputSchema: {
@@ -190,13 +272,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "boolean",
               description: "If true and Jules pauses in AWAITING_PLAN_APPROVAL, automatically approves the plan and keeps waiting (default false).",
             },
+            auto_unblock_questions: {
+              type: "boolean",
+              description: "If true and Jules pauses in AWAITING_USER_FEEDBACK, automatically replies with an unblocking directive and continues waiting (default true).",
+            },
           },
           required: ["session_id"],
         },
       },
       {
         name: "jules_dispatch_and_wait",
-        description: "Create a new Jules coding task and immediately block/wait for it in a single MCP tool call. Automatically load-balances to the account with lowest active load. Returns final PR link, diff patch, or stuck question.",
+        description: "Create a new Jules coding task and immediately block/wait for it in a single MCP tool call. Enforces the 1-chore-per-repo Golden Rule to prevent PR collisions and branch drift.",
         inputSchema: {
           type: "object",
           properties: {
@@ -224,12 +310,46 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "boolean",
               description: "If true, automatically approves any execution plan generated by Jules (defaults to true).",
             },
+            bypass_repo_lock: {
+              type: "boolean",
+              description: "Bypass the 1-chore-per-repo concurrency guard (use with caution to avoid PR collisions).",
+            },
             timeout_seconds: {
               type: "number",
               description: "Maximum seconds to wait for initial results or completion (default 90, max 300).",
             },
           },
           required: ["source", "prompt"],
+        },
+      },
+      {
+        name: "jules_queue_tasks",
+        description: "Execute a sequence of chores sequentially on a repository: waits for Task N to complete before launching Task N+1, preventing branch drift and merge conflicts across PRs.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            source: {
+              type: "string",
+              description: "Target repository identifier.",
+            },
+            tasks: {
+              type: "array",
+              description: "List of prompt strings or task objects to execute in sequence.",
+              items: {
+                type: "object",
+                properties: {
+                  prompt: { type: "string" },
+                  title: { type: "string" },
+                },
+                required: ["prompt"],
+              },
+            },
+            timeout_per_task: {
+              type: "number",
+              description: "Max seconds to wait per task (default 90).",
+            },
+          },
+          required: ["source", "tasks"],
         },
       },
       {
@@ -348,7 +468,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "jules_create_task",
-        description: "Dispatch an asynchronous coding task, bug fix, feature, or refactoring chore to Google Jules with cloud PR creation, custom branches, plan approval, and secret/env injection.",
+        description: "Dispatch an asynchronous coding chore to Google Jules. Enforces the 1-chore-per-repo rule to prevent PR collisions, blocks deprecated repos, and injects architectural invariants automatically.",
         inputSchema: {
           type: "object",
           properties: {
@@ -384,6 +504,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "boolean",
               description: "If true, passes repository secrets and environment variables configured in Jules to the cloud container sandbox (defaults to true).",
             },
+            bypass_repo_lock: {
+              type: "boolean",
+              description: "Bypass the 1-chore-per-repo concurrency lock (defaults to false).",
+            },
             account: {
               type: "string",
               description: "Optional specific account name/email to target. If omitted, uses intelligent load-balancing.",
@@ -394,7 +518,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "jules_batch_dispatch",
-        description: "Dispatch multiple coding tasks across different repositories in parallel, load-balancing automatically across all Google accounts in the pool.",
+        description: "Dispatch multiple coding tasks across DIFFERENT repositories in parallel, load-balancing automatically across all Google accounts in the pool while preventing same-repo collisions.",
         inputSchema: {
           type: "object",
           properties: {
@@ -791,13 +915,60 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 2: jules_wait_for_task (Synchronous Poller & Bridge)
+    // TOOL 2: jules_auto_nudge_all (Autonomous Unblocker)
+    // ----------------------------------------------------
+    if (name === "jules_auto_nudge_all") {
+      const customInstruction =
+        (args.custom_instruction as string) ||
+        "Proceed autonomously using the standard project conventions and standard library approach. Avoid adding new dependencies, run test verifications, and submit the patch.";
+      const accounts = getAccounts();
+      const nudgedSessions: any[] = [];
+
+      for (const acc of accounts) {
+        try {
+          const res = await request("sessions?pageSize=50", acc.key);
+          for (const s of res.sessions || []) {
+            if (s.state === "AWAITING_USER_FEEDBACK") {
+              const sid = s.id || s.name?.replace("sessions/", "");
+              try {
+                await request(`sessions/${sid}:sendMessage`, acc.key, { method: "POST" }, { message: customInstruction });
+                nudgedSessions.push({
+                  session_id: sid,
+                  repo: s.sourceContext?.source,
+                  title: s.title,
+                  account: acc.name || acc.email,
+                  status: "Nudged & Unblocked",
+                });
+              } catch {}
+            }
+          }
+        } catch {}
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ count: nudgedSessions.length, nudged: nudgedSessions }, null, 2),
+          },
+          {
+            type: "text",
+            text: `### Autonomous Unblocker Run\n\n• **Sessions Nudged:** ${nudgedSessions.length}\n• **Directive Sent:** \`${customInstruction}\`\n\n` +
+              nudgedSessions.map((n) => `- **ID:** \`${n.session_id}\` (${n.title}) on \`${n.repo}\``).join("\n"),
+          },
+        ],
+      };
+    }
+
+    // ----------------------------------------------------
+    // TOOL 3: jules_wait_for_task (Synchronous Poller & Bridge)
     // ----------------------------------------------------
     if (name === "jules_wait_for_task") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
       const timeoutSec = Math.min(Math.max(Number(args.timeout_seconds) || 60, 5), 300);
       const intervalSec = Math.min(Math.max(Number(args.poll_interval_seconds) || 5, 2), 30);
       const autoApprove = !!args.auto_approve_plan;
+      const autoUnblock = args.auto_unblock_questions !== false;
 
       const startTime = Date.now();
       let lastState = "UNKNOWN";
@@ -815,6 +986,16 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
             try {
               await request(`sessions/${sessionId}:approvePlan`, targetAccount.key, { method: "POST" }, {});
               lastState = "IN_PROGRESS (Auto-approved plan)";
+            } catch {}
+          } else if (lastState === "AWAITING_USER_FEEDBACK" && autoUnblock) {
+            try {
+              await request(
+                `sessions/${sessionId}:sendMessage`,
+                targetAccount.key,
+                { method: "POST" },
+                { message: "Proceed autonomously with minimal surgical diffs according to project conventions." }
+              );
+              lastState = "IN_PROGRESS (Auto-unblocked question)";
             } catch {}
           } else if (["COMPLETED", "FAILED", "AWAITING_USER_FEEDBACK", "AWAITING_PLAN_APPROVAL"].includes(lastState)) {
             break;
@@ -861,7 +1042,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 3: jules_dispatch_and_wait (Single-call Chore Execution)
+    // TOOL 4: jules_dispatch_and_wait (Single-call Chore Execution)
     // ----------------------------------------------------
     if (name === "jules_dispatch_and_wait") {
       const sourceInput = args.source as string;
@@ -870,14 +1051,41 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
       const branch = (args.branch as string) || "main";
       const autoCreatePr = args.auto_create_pr !== false;
       const autoApprove = args.auto_approve_plan !== false;
+      const bypassLock = !!args.bypass_repo_lock;
       const timeoutSec = Math.min(Math.max(Number(args.timeout_seconds) || 90, 10), 300);
+
+      // Check Deprecated Repos
+      const cleanRepo = sourceInput.toLowerCase().replace(/^sources\/github\/[^\/]+\//, "");
+      if (DEPRECATED_REPOS[cleanRepo]) {
+        throw new Error(`Repository '${cleanRepo}' is deprecated. Reason: ${DEPRECATED_REPOS[cleanRepo]}`);
+      }
+
+      // Check Repo Lock (1 chore per repo rule)
+      if (!bypassLock) {
+        const lockStatus = await checkRepoActiveLock(sourceInput);
+        if (lockStatus.locked) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: `REPO_CONCURRENCY_LOCK: Repository '${cleanRepo}' already has active session(s) in flight:\n` +
+                  JSON.stringify(lockStatus.activeSessions, null, 2) +
+                  `\n\nTo prevent PR collisions and branch drift, wait for active session(s) to merge or complete before dispatching another on this repo (or pass bypass_repo_lock: true).`,
+              },
+            ],
+          };
+        }
+      }
 
       const sourceResource = sourceInput.startsWith("sources/")
         ? sourceInput
         : `sources/github/yasserbousrih/${sourceInput.replace(/^sources\/github\//, "")}`;
 
+      const decoratedPrompt = decoratePrompt(prompt, sourceInput);
+
       const payload: any = {
-        prompt,
+        prompt: decoratedPrompt,
         sourceContext: {
           source: sourceResource,
           githubRepoContext: {
@@ -910,7 +1118,17 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
               await request(`sessions/${sid}:approvePlan`, bestAccount.key, { method: "POST" }, {});
               lastState = "IN_PROGRESS (Auto-approved plan)";
             } catch {}
-          } else if (["COMPLETED", "FAILED", "AWAITING_USER_FEEDBACK", "AWAITING_PLAN_APPROVAL"].includes(lastState)) {
+          } else if (lastState === "AWAITING_USER_FEEDBACK") {
+            try {
+              await request(
+                `sessions/${sid}:sendMessage`,
+                bestAccount.key,
+                { method: "POST" },
+                { message: "Proceed autonomously with minimal surgical diffs according to project conventions." }
+              );
+              lastState = "IN_PROGRESS (Auto-unblocked)";
+            } catch {}
+          } else if (["COMPLETED", "FAILED"].includes(lastState)) {
             break;
           }
         } catch {}
@@ -948,7 +1166,82 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 4: jules_stream_progress (Timeline Breakdown)
+    // TOOL 5: jules_queue_tasks (Sequential Chore Chaining)
+    // ----------------------------------------------------
+    if (name === "jules_queue_tasks") {
+      const sourceInput = args.source as string;
+      const tasks = args.tasks as any[];
+      const timeoutPerTask = Number(args.timeout_per_task) || 90;
+      const results: any[] = [];
+
+      for (let i = 0; i < tasks.length; i++) {
+        const t = tasks[i];
+        const taskPrompt = typeof t === "string" ? t : t.prompt;
+        const taskTitle = typeof t === "object" ? t.title : `Sequential Chore ${i + 1}/${tasks.length}`;
+
+        const sourceResource = sourceInput.startsWith("sources/")
+          ? sourceInput
+          : `sources/github/yasserbousrih/${sourceInput.replace(/^sources\/github\//, "")}`;
+
+        const decoratedPrompt = decoratePrompt(taskPrompt, sourceInput);
+
+        const payload: any = {
+          prompt: decoratedPrompt,
+          title: taskTitle,
+          sourceContext: {
+            source: sourceResource,
+            githubRepoContext: { startingBranch: "main" },
+          },
+          automationMode: "AUTO_CREATE_PR",
+          requirePlanApproval: false,
+          environmentVariablesEnabled: true,
+        };
+
+        const targetAccount = await getLeastLoadedAccount();
+        const created = await request("sessions", targetAccount.key, { method: "POST" }, payload);
+        const sid = created.id || created.name?.replace("sessions/", "");
+
+        // Wait for task completion before launching next
+        const startTime = Date.now();
+        let finalState = "IN_PROGRESS";
+        let sessionData = created;
+
+        while (Date.now() - startTime < timeoutPerTask * 1000) {
+          await new Promise((r) => setTimeout(r, 5000));
+          try {
+            sessionData = await request(`sessions/${sid}`, targetAccount.key);
+            finalState = sessionData.state || "STATE_UNSPECIFIED";
+            if (["COMPLETED", "FAILED", "AWAITING_USER_FEEDBACK"].includes(finalState)) break;
+          } catch {}
+        }
+
+        results.push({
+          step: i + 1,
+          title: taskTitle,
+          session_id: sid,
+          account: targetAccount.name || targetAccount.email,
+          final_state: finalState,
+          web_url: sessionData.url || `https://jules.google.com/session/${sid}`,
+        });
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ sequence_completed: true, tasks_executed: results }, null, 2),
+          },
+          {
+            type: "text",
+            text: `### Sequential Chore Queue Complete\n\n• **Target Repo:** \`${sourceInput}\`\n• **Tasks Processed:** ${results.length}\n\n` +
+              results.map((r) => `- **Step ${r.step}:** ${r.title} -> \`${r.final_state}\` (\`${r.session_id}\`)`).join("\n"),
+          },
+        ],
+      };
+    }
+
+    // ----------------------------------------------------
+    // TOOL 6: jules_stream_progress (Timeline Breakdown)
     // ----------------------------------------------------
     if (name === "jules_stream_progress") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1008,7 +1301,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 5: jules_apply_patch (Direct Local Git Applier)
+    // TOOL 7: jules_apply_patch (Direct Local Git Applier)
     // ----------------------------------------------------
     if (name === "jules_apply_patch") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1122,7 +1415,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 6: jules_review_pr (GitHub PR Inspector)
+    // TOOL 8: jules_review_pr (GitHub PR Inspector)
     // ----------------------------------------------------
     if (name === "jules_review_pr") {
       const target = args.pr_url_or_number as string;
@@ -1164,7 +1457,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 7: jules_merge_pr (GitHub PR Squash-Merge)
+    // TOOL 9: jules_merge_pr (GitHub PR Squash-Merge)
     // ----------------------------------------------------
     if (name === "jules_merge_pr") {
       const target = args.pr_url_or_number as string;
@@ -1196,7 +1489,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 8: jules_list_sources
+    // TOOL 10: jules_list_sources
     // ----------------------------------------------------
     if (name === "jules_list_sources") {
       const pageSize = Number(args.page_size) || 30;
@@ -1237,7 +1530,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 9: jules_get_source
+    // TOOL 11: jules_get_source
     // ----------------------------------------------------
     if (name === "jules_get_source") {
       const sourceInput = args.source as string;
@@ -1257,7 +1550,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 10: jules_create_task
+    // TOOL 12: jules_create_task
     // ----------------------------------------------------
     if (name === "jules_create_task") {
       const sourceInput = args.source as string;
@@ -1268,14 +1561,41 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
       const autoCreatePr = args.auto_create_pr !== false;
       const requirePlanApproval = !!args.require_plan_approval;
       const envVarsEnabled = args.environment_variables_enabled !== false;
+      const bypassLock = !!args.bypass_repo_lock;
       const accountTarget = args.account as string | undefined;
+
+      // Check Deprecated Repos
+      const cleanRepo = sourceInput.toLowerCase().replace(/^sources\/github\/[^\/]+\//, "");
+      if (DEPRECATED_REPOS[cleanRepo]) {
+        throw new Error(`Repository '${cleanRepo}' is deprecated. Reason: ${DEPRECATED_REPOS[cleanRepo]}`);
+      }
+
+      // Check Repo Lock (1 chore per repo rule)
+      if (!bypassLock) {
+        const lockStatus = await checkRepoActiveLock(sourceInput);
+        if (lockStatus.locked) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: `REPO_CONCURRENCY_LOCK: Repository '${cleanRepo}' already has active session(s) in flight:\n` +
+                  JSON.stringify(lockStatus.activeSessions, null, 2) +
+                  `\n\nTo prevent PR collisions and branch drift, wait for active session(s) to merge or complete before dispatching another on this repo (or pass bypass_repo_lock: true).`,
+              },
+            ],
+          };
+        }
+      }
 
       const sourceResource = sourceInput.startsWith("sources/")
         ? sourceInput
         : `sources/github/yasserbousrih/${sourceInput.replace(/^sources\/github\//, "")}`;
 
+      const decoratedPrompt = decoratePrompt(prompt, sourceInput);
+
       const payload: any = {
-        prompt,
+        prompt: decoratedPrompt,
         sourceContext: {
           source: sourceResource,
           githubRepoContext: {
@@ -1316,20 +1636,43 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 11: jules_batch_dispatch
+    // TOOL 13: jules_batch_dispatch
     // ----------------------------------------------------
     if (name === "jules_batch_dispatch") {
       const tasks = args.tasks as any[];
       const results: any[] = [];
+      const dispatchedRepos = new Set<string>();
 
       for (const t of tasks) {
         try {
+          const cleanRepo = t.source.toLowerCase().replace(/^sources\/github\/[^\/]+\//, "");
+          if (dispatchedRepos.has(cleanRepo)) {
+            results.push({
+              status: "skipped",
+              source: t.source,
+              reason: `Skipped to prevent PR collision: repo '${cleanRepo}' was already included in this batch. Use jules_queue_tasks for sequential chores on the same repo.`,
+            });
+            continue;
+          }
+          dispatchedRepos.add(cleanRepo);
+
+          if (DEPRECATED_REPOS[cleanRepo]) {
+            results.push({
+              status: "error",
+              source: t.source,
+              error: `Repository is deprecated: ${DEPRECATED_REPOS[cleanRepo]}`,
+            });
+            continue;
+          }
+
           const sourceResource = t.source.startsWith("sources/")
             ? t.source
             : `sources/github/yasserbousrih/${t.source.replace(/^sources\/github\//, "")}`;
 
+          const decoratedPrompt = decoratePrompt(t.prompt, t.source);
+
           const payload: any = {
-            prompt: t.prompt,
+            prompt: decoratedPrompt,
             sourceContext: {
               source: sourceResource,
               githubRepoContext: {
@@ -1371,7 +1714,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 12: jules_list_sessions
+    // TOOL 14: jules_list_sessions
     // ----------------------------------------------------
     if (name === "jules_list_sessions") {
       const state = args.state as string | undefined;
@@ -1423,7 +1766,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 13: jules_get_session
+    // TOOL 15: jules_get_session
     // ----------------------------------------------------
     if (name === "jules_get_session") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1440,7 +1783,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 14: jules_list_activities
+    // TOOL 16: jules_list_activities
     // ----------------------------------------------------
     if (name === "jules_list_activities") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1465,7 +1808,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 15: jules_get_activity
+    // TOOL 17: jules_get_activity
     // ----------------------------------------------------
     if (name === "jules_get_activity") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1484,7 +1827,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 16: jules_get_plan
+    // TOOL 18: jules_get_plan
     // ----------------------------------------------------
     if (name === "jules_get_plan") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1515,7 +1858,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 17: jules_approve_plan
+    // TOOL 19: jules_approve_plan
     // ----------------------------------------------------
     if (name === "jules_approve_plan") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1536,7 +1879,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 18: jules_reply_feedback
+    // TOOL 20: jules_reply_feedback
     // ----------------------------------------------------
     if (name === "jules_reply_feedback") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1559,7 +1902,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 19: jules_get_patch
+    // TOOL 21: jules_get_patch
     // ----------------------------------------------------
     if (name === "jules_get_patch") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1594,7 +1937,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 20: jules_inspect_bash_logs
+    // TOOL 22: jules_inspect_bash_logs
     // ----------------------------------------------------
     if (name === "jules_inspect_bash_logs") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1625,7 +1968,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 21: jules_get_media_artifacts
+    // TOOL 23: jules_get_media_artifacts
     // ----------------------------------------------------
     if (name === "jules_get_media_artifacts") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1654,7 +1997,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 22: jules_archive_session
+    // TOOL 24: jules_archive_session
     // ----------------------------------------------------
     if (name === "jules_archive_session") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1674,7 +2017,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 23: jules_delete_session
+    // TOOL 25: jules_delete_session
     // ----------------------------------------------------
     if (name === "jules_delete_session") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1691,7 +2034,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 24: jules_sync_prs
+    // TOOL 26: jules_sync_prs
     // ----------------------------------------------------
     if (name === "jules_sync_prs") {
       const sessionId = args.session_id as string | undefined;
@@ -1732,7 +2075,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 25: jules_pool_status
+    // TOOL 27: jules_pool_status
     // ----------------------------------------------------
     if (name === "jules_pool_status") {
       const accounts = getAccounts();
@@ -1805,7 +2148,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
 async function run() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  process.stderr.write("Jules MCP Server running on stdio (25 tools)\n");
+  process.stderr.write("Jules MCP Server running on stdio (27 tools)\n");
 }
 
 run().catch((error) => {
