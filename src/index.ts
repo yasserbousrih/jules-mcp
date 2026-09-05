@@ -2081,12 +2081,20 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
       const sessionId = (args.session_id as string).replace("sessions/", "");
       const { data } = await requestWithFallback(`sessions/${sessionId}`);
 
-      let gitPatch = null;
-      let commitMessage = null;
+      let gitPatch: string | null = null;
+      let commitMessage: string | null = null;
       for (const out of data.outputs || []) {
         if (out.changeSet) {
-          gitPatch = out.changeSet.gitPatch;
-          commitMessage = out.changeSet.suggestedCommitMessage;
+          if (typeof out.changeSet.gitPatch === "string") {
+            gitPatch = out.changeSet.gitPatch;
+          } else if (out.changeSet.gitPatch?.unidiffPatch) {
+            gitPatch = out.changeSet.gitPatch.unidiffPatch;
+          }
+          if (out.changeSet.suggestedCommitMessage) {
+            commitMessage = out.changeSet.suggestedCommitMessage;
+          } else if (out.changeSet.gitPatch?.suggestedCommitMessage) {
+            commitMessage = out.changeSet.gitPatch.suggestedCommitMessage;
+          }
         }
       }
 
