@@ -80,7 +80,7 @@ async function request(endpoint: string, apiKey: string, options: https.RequestO
 const server = new Server(
   {
     name: "jules-mcp",
-    version: "0.1.0",
+    version: "0.2.0",
   },
   {
     capabilities: {
@@ -102,7 +102,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "jules_create_task",
-        description: "Dispatch an asynchronous coding chore, bug fix, or suggestion to Google Jules in the cloud.",
+        description: "Dispatch an asynchronous coding chore, bug fix, or suggestion to Google Jules with cloud PR creation, custom branches, and plan approval options.",
         inputSchema: {
           type: "object",
           properties: {
@@ -116,7 +116,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             branch: {
               type: "string",
-              description: "Target branch name (defaults to main/master).",
+              description: "Target base branch name (defaults to main/master).",
+            },
+            working_branch: {
+              type: "string",
+              description: "Optional custom branch name to push the changes to.",
+            },
+            auto_create_pr: {
+              type: "boolean",
+              description: "If true, Jules will automatically open a GitHub PR directly in the cloud (defaults to true).",
+            },
+            require_plan_approval: {
+              type: "boolean",
+              description: "If true, Jules generates a multi-step plan first and waits for explicit approval before writing code.",
             },
           },
           required: ["source", "prompt"],
@@ -124,7 +136,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "jules_get_session",
-        description: "Retrieve status, outputs, unidiff patches, and activity history for a Google Jules session.",
+        description: "Retrieve full status, outputs, unidiff patches, and execution timeline for a Google Jules session.",
         inputSchema: {
           type: "object",
           properties: {
@@ -137,8 +149,26 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "jules_approve_plan",
+        description: "Approve a generated execution plan for a Jules session waiting in AWAITING_PLAN_APPROVAL.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            session_id: {
+              type: "string",
+              description: "The unique Jules session ID.",
+            },
+            plan_id: {
+              type: "string",
+              description: "Optional specific plan ID to approve (auto-detects the latest plan if omitted).",
+            },
+          },
+          required: ["session_id"],
+        },
+      },
+      {
         name: "jules_reply_feedback",
-        description: "Send a user feedback or reply message to unblock a Jules session paused in AWAITING_USER_FEEDBACK.",
+        description: "Send a feedback or reply message to unblock a Jules session paused in AWAITING_USER_FEEDBACK.",
         inputSchema: {
           type: "object",
           properties: {
@@ -155,8 +185,54 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "jules_inspect_bash_logs",
+        description: "Inspect raw bash commands, exit codes, and stdout/stderr execution outputs produced by Jules in the cloud sandbox.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            session_id: {
+              type: "string",
+              description: "The unique Jules session ID.",
+            },
+          },
+          required: ["session_id"],
+        },
+      },
+      {
+        name: "jules_archive_session",
+        description: "Archive or unarchive a Jules session to clean up the active dashboard.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            session_id: {
+              type: "string",
+              description: "The unique Jules session ID.",
+            },
+            unarchive: {
+              type: "boolean",
+              description: "If true, unarchive the session instead of archiving.",
+            },
+          },
+          required: ["session_id"],
+        },
+      },
+      {
+        name: "jules_delete_session",
+        description: "Permanently delete a Jules session.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            session_id: {
+              type: "string",
+              description: "The unique Jules session ID.",
+            },
+          },
+          required: ["session_id"],
+        },
+      },
+      {
         name: "jules_sync_prs",
-        description: "Extract completed patches from Jules sessions and automatically create verified GitHub Pull Requests.",
+        description: "Extract completed patches from Jules sessions and automatically create verified GitHub Pull Requests locally.",
         inputSchema: {
           type: "object",
           properties: {
@@ -207,10 +283,12 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
         const sourceInput = (args as any).source;
         const promptText = (args as any).prompt;
         const branch = (args as any).branch || "main";
+        const workingBranch = (args as any).working_branch;
+        const autoPr = (args as any).auto_create_pr !== false;
+        const requirePlan = !!(args as any).require_plan_approval;
 
         let sourceName = sourceInput;
         if (!sourceName.startsWith("sources/")) {
-          // Resolve short repo name
           const data = await request("sources", account.key);
           const found = (data.sources || []).find((s: any) =>
             s.name.toLowerCase().includes(sourceInput.toLowerCase())
@@ -222,14 +300,21 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
           }
         }
 
+        const sourceContext: any = {
+          source: sourceName,
+          githubRepoContext: {
+            startingBranch: branch,
+          },
+        };
+        if (workingBranch) {
+          sourceContext.workingBranch = workingBranch;
+        }
+
         const payload = {
           prompt: promptText,
-          sourceContext: {
-            source: sourceName,
-            githubRepoContext: {
-              startingBranch: branch,
-            },
-          },
+          sourceContext,
+          automationMode: autoPr ? "AUTO_CREATE_PR" : "AUTOMATION_MODE_UNSPECIFIED",
+          requirePlanApproval: requirePlan,
         };
 
         const res = await request("sessions", account.key, { method: "POST" }, payload);
@@ -237,7 +322,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
           content: [
             {
               type: "text",
-              text: `✅ Task dispatched to Google Jules!\nAccount: ${account.name || account.email}\nSession ID: ${res.id || res.name}\nSource: ${sourceName}\nState: ${res.state || "QUEUED"}`,
+              text: `✅ Task dispatched to Google Jules!\nAccount: ${account.name || account.email}\nSession ID: ${res.id || res.name}\nSource: ${sourceName}\nState: ${res.state || "QUEUED"}\nAuto PR: ${autoPr}\nPlan Approval Required: ${requirePlan}`,
             },
           ],
         };
@@ -280,6 +365,57 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
         };
       }
 
+      case "jules_approve_plan": {
+        const sid = (args as any).session_id.replace(/^sessions\//, "");
+        let planId = (args as any).plan_id;
+        const config = loadConfig();
+
+        if (!planId) {
+          for (const acc of config.accounts) {
+            try {
+              const activitiesData = await request(`sessions/${sid}/activities`, acc.key);
+              for (const act of (activitiesData.activities || []).reverse()) {
+                const p = act.planGenerated?.plan;
+                if (p?.id) {
+                  planId = p.id;
+                  break;
+                }
+              }
+              if (planId) break;
+            } catch {}
+          }
+        }
+
+        if (!planId) {
+          throw new Error(`No plan found to approve in session ${sid}`);
+        }
+
+        let approved = false;
+        let lastErr = "";
+        for (const acc of config.accounts) {
+          try {
+            await request(
+              `sessions/${sid}:approvePlan`,
+              acc.key,
+              { method: "POST" },
+              { planId }
+            );
+            approved = true;
+            break;
+          } catch (e: any) {
+            lastErr = e.message;
+          }
+        }
+
+        if (!approved) {
+          throw new Error(`Failed to approve plan ${planId} for session ${sid}: ${lastErr}`);
+        }
+
+        return {
+          content: [{ type: "text", text: `✅ Plan ${planId} successfully approved for session ${sid}.` }],
+        };
+      }
+
       case "jules_reply_feedback": {
         const sid = (args as any).session_id.replace(/^sessions\//, "");
         const msg = (args as any).message;
@@ -293,7 +429,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
               `sessions/${sid}:sendMessage`,
               acc.key,
               { method: "POST" },
-              { message: msg }
+              { prompt: msg }
             );
             success = true;
             break;
@@ -316,6 +452,92 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
         };
       }
 
+      case "jules_inspect_bash_logs": {
+        const sid = (args as any).session_id.replace(/^sessions\//, "");
+        const config = loadConfig();
+        const logs: any[] = [];
+
+        for (const acc of config.accounts) {
+          try {
+            const data = await request(`sessions/${sid}/activities`, acc.key);
+            for (const act of data.activities || []) {
+              for (const art of act.artifacts || []) {
+                if (art.bashOutput) {
+                  logs.push({
+                    time: act.createTime,
+                    command: art.bashOutput.command,
+                    exitCode: art.bashOutput.exitCode,
+                    output: art.bashOutput.output,
+                  });
+                }
+              }
+            }
+            break;
+          } catch {}
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: logs.length ? JSON.stringify(logs, null, 2) : `No bash execution logs found for session ${sid}.`,
+            },
+          ],
+        };
+      }
+
+      case "jules_archive_session": {
+        const sid = (args as any).session_id.replace(/^sessions\//, "");
+        const unarchive = !!(args as any).unarchive;
+        const method = unarchive ? "unarchive" : "archive";
+        const config = loadConfig();
+        let ok = false;
+        let lastErr = "";
+
+        for (const acc of config.accounts) {
+          try {
+            await request(`sessions/${sid}:${method}`, acc.key, { method: "POST" }, {});
+            ok = true;
+            break;
+          } catch (e: any) {
+            lastErr = e.message;
+          }
+        }
+
+        if (!ok) {
+          throw new Error(`Failed to ${method} session ${sid}: ${lastErr}`);
+        }
+
+        return {
+          content: [{ type: "text", text: `✅ Session ${sid} successfully ${unarchive ? "unarchived" : "archived"}.` }],
+        };
+      }
+
+      case "jules_delete_session": {
+        const sid = (args as any).session_id.replace(/^sessions\//, "");
+        const config = loadConfig();
+        let ok = false;
+        let lastErr = "";
+
+        for (const acc of config.accounts) {
+          try {
+            await request(`sessions/${sid}`, acc.key, { method: "DELETE" });
+            ok = true;
+            break;
+          } catch (e: any) {
+            lastErr = e.message;
+          }
+        }
+
+        if (!ok) {
+          throw new Error(`Failed to delete session ${sid}: ${lastErr}`);
+        }
+
+        return {
+          content: [{ type: "text", text: `✅ Session ${sid} permanently deleted.` }],
+        };
+      }
+
       case "jules_sync_prs": {
         const dryRun = (args as any)?.dry_run ? "--dry-run" : "";
         const sid = (args as any)?.session_id ? `--session ${(args as any).session_id}` : "";
@@ -332,7 +554,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
           try {
             const data = await request("sessions", acc.key);
             const sessions = data.sessions || [];
-            const active = sessions.filter((s: any) => s.state === "IN_PROGRESS" || s.state === "AWAITING_USER_FEEDBACK");
+            const active = sessions.filter((s: any) => s.state === "IN_PROGRESS" || s.state === "AWAITING_USER_FEEDBACK" || s.state === "AWAITING_PLAN_APPROVAL");
             const completed = sessions.filter((s: any) => s.state === "COMPLETED");
             poolStatus.push({
               account: acc.name || acc.email,
