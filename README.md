@@ -1,25 +1,31 @@
 # Jules MCP Server (`jules-mcp`)
 
-Universal Model Context Protocol (MCP) server for Google Jules Cloud Agent with 100% native REST API coverage, multi-account pooling, automated load balancing, 24-hour rolling quota ledger, container test runner auto-injection, standardized chore recipes, preflight conflict dry-runs, and multi-session 3-way consolidation.
+Universal Model Context Protocol (MCP) server for Google Jules Cloud Agent with 100% native REST API coverage, multi-account pooling, automated load balancing, 24-hour rolling quota ledger, container test runner auto-injection, standardized chore recipes, persistent quota queuing, file collision locks, exponential backoff retries, semantic conflict resolution, preflight conflict dry-runs, and multi-session 3-way consolidation.
 
 ### Key Capabilities:
 1. **Parallel Cloud Dispatching**: Fire multiple chores on the same repo or across repos concurrently.
-2. **Local 3-Way Patch Reconciliation (`jules_consolidate_sessions`)**: Fetches unidiff patches from all completed sessions, applies them sequentially with `git apply --3way`, runs project test suites, and opens **1 clean consolidated GitHub PR**—eliminating PR collisions and branch drift completely.
+2. **Local 3-Way Patch Reconciliation (`jules_consolidate_sessions`)**: Fetches unidiff patches from all completed sessions, applies them sequentially with `git apply --3way` and semantic fallback for non-overlapping imports/functions, runs project test suites, and opens **1 clean consolidated GitHub PR**—eliminating PR collisions and branch drift completely.
 3. **Preflight Dry-Run Conflict Check (`jules_verify_patch`)**: Evaluates a completed session's unidiff patch against a local workspace using `git apply --check --3way` before modifying any files or branches.
-4. **Standardized Chore Recipes (`jules_recipe_dispatch`)**: High-efficiency blueprints for recurring grunt work (`scaffold-unit-test`, `add-strict-types`, `document-endpoints`, `clean-dead-code`, `refactor-isolated-helper`).
-5. **Rolling 24-Hour Quota Ledger (`jules_pool_status`)**: Tracks timestamps for every dispatch across all 3 accounts in `~/.config/jules/usage.json`, ensuring guaranteed quota and predicting reset minutes with zero silent 429 errors.
-6. **Container Test Runner Auto-Injection**: Detects repository stack (Python/FastAPI vs Next.js/TypeScript) and injects explicit container sandbox test instructions (`pytest` / `npm run build && npm test`) into Jules's execution prompt.
-7. **Automated Remote PR Rebase (`jules_rebase_pr`)**: Rebases outdated cloud PRs against the latest `main` branch locally and force-pushes with lease.
-8. **Zero Freeze Pauses**: Autonomous unblocking directives, auto-plan approvals, and `jules_auto_nudge_all`.
+4. **Persistent Quota Task Queue (`jules_queue_status` / `jules_drain_queue`)**: Holds tasks in `~/.config/jules/queue.json` when the rolling 24-hour pool quota is saturated and drains them automatically as slots open up.
+5. **In-Flight File Locks (`jules_inspect_locks`)**: Tracks active tasks per file in `~/.config/jules/locks.json` to prevent concurrent colliding modifications to the same file.
+6. **Exponential Backoff & Network Jitter**: Retries transient Google Jules API drops (500/502/503/504, network drops, timeouts) with randomized exponential delay.
+7. **Standardized Chore Recipes (`jules_recipe_dispatch`)**: High-efficiency blueprints for recurring grunt work (`scaffold-unit-test`, `add-strict-types`, `document-endpoints`, `clean-dead-code`, `refactor-isolated-helper`).
+8. **Rolling 24-Hour Quota Ledger (`jules_pool_status`)**: Tracks timestamps for every dispatch across all 3 accounts in `~/.config/jules/usage.json`, ensuring guaranteed quota and predicting reset minutes with zero silent 429 errors.
+9. **Container Test Runner Auto-Injection**: Detects repository stack (Python/FastAPI vs Next.js/TypeScript) and injects explicit container sandbox test instructions (`pytest` / `npm run build && npm test`) into Jules's execution prompt.
+10. **Automated Remote PR Rebase (`jules_rebase_pr`)**: Rebases outdated cloud PRs against the latest `main` branch locally and force-pushes with lease.
+11. **Zero Freeze Pauses**: Autonomous unblocking directives, auto-plan approvals, and `jules_auto_nudge_all`.
 
 ---
 
-## Complete MCP Tool Reference (31 Tools)
+## Complete MCP Tool Reference (34 Tools)
 
-### 1. Harness Intelligence & Multi-Session Consolidation
-- **`jules_consolidate_sessions`** — Reconcile and merge multiple concurrent Jules sessions on the SAME repository into a single clean local branch or unified PR. Uses 3-way unidiff application to resolve cloud branch drift automatically, runs tests, and creates 1 clean PR.
+### 1. Harness Intelligence, Queue & Multi-Session Consolidation
+- **`jules_consolidate_sessions`** — Reconcile and merge multiple concurrent Jules sessions on the SAME repository into a single clean local branch or unified PR. Uses 3-way unidiff application and semantic conflict resolution to resolve cloud branch drift automatically, runs tests, and creates 1 clean PR.
 - **`jules_verify_patch`** — Dry-run preflight check: inspects a completed session's git patch and runs `git apply --check --3way` against a local workspace to verify whether the patch will apply cleanly with 0 conflicts before creating branches or writing files.
 - **`jules_recipe_dispatch`** — Dispatch a standardized, high-efficiency chore recipe with pre-tested prompt blueprints (`scaffold-unit-test`, `add-strict-types`, `document-endpoints`, `clean-dead-code`, `refactor-isolated-helper`).
+- **`jules_queue_status`** — Inspect persistent task queue (`~/.config/jules/queue.json`), queued backlog depth, available pool slots, and countdown to earliest slot reset.
+- **`jules_drain_queue`** — Drain and dispatch queued tasks to Google Jules accounts with newly available 24h rolling quota slots.
+- **`jules_inspect_locks`** — List active in-flight file locks across repositories to monitor parallel task partitioning and prevent file collisions.
 - **`jules_rebase_pr`** — Rebases an existing Jules PR against latest `main` branch locally and force-pushes with lease, eliminating GitHub out-of-date branch warnings.
 - **`jules_check_events`** — Real-time event monitor for the entire multi-account pool: detects stuck tasks, plans needing approval, completed tasks, and failures.
 - **`jules_auto_nudge_all`** — Pool-wide autonomous unblocker: unblocks all sessions paused in `AWAITING_USER_FEEDBACK` with standard execution directives.
@@ -69,41 +75,15 @@ Universal Model Context Protocol (MCP) server for Google Jules Cloud Agent with 
 ```json
 {
   "accounts": [
-    {
-      "name": "yasser040503@gmail.com",
-      "key": "AQ.Ab8...",
-      "active": true
-    },
-    {
-      "name": "bousrihyasser@gmail.com",
-      "key": "AQ.Ab8...",
-      "active": true
-    },
-    {
-      "name": "yasserbousrih0405@gmail.com",
-      "key": "AQ.Ab8...",
-      "active": true
-    }
+    { "name": "Primary", "email": "yasser040503@gmail.com", "key": "[REDACTED]" },
+    { "name": "Secondary", "email": "bousrihyasser@gmail.com", "key": "[REDACTED]" },
+    { "name": "Tertiary", "email": "yasserbousrih0405@gmail.com", "key": "[REDACTED]" }
   ]
 }
 ```
 
-### Claude Code (`~/.claude/settings.json`)
-```json
-{
-  "mcpServers": {
-    "jules": {
-      "command": "jules-mcp",
-      "args": []
-    }
-  }
-}
-```
-
-## Running Tests
+### Build & Run
 ```bash
+npm run build
 npm test
 ```
-
-## License
-MIT
