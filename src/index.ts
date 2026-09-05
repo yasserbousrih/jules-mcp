@@ -26,14 +26,27 @@ interface JulesConfig {
 }
 
 function loadConfig(): JulesConfig {
+  if (fs.existsSync(CONFIG_PATH)) {
+    try {
+      const raw = fs.readFileSync(CONFIG_PATH, "utf-8");
+      const parsed = JSON.parse(raw);
+      if (parsed.accounts && parsed.accounts.length > 0) {
+        return parsed;
+      }
+    } catch {}
+  }
   if (process.env.JULES_API_KEY) {
     return { accounts: [{ key: process.env.JULES_API_KEY, name: "env-key" }] };
   }
-  if (!fs.existsSync(CONFIG_PATH)) {
-    throw new Error(`Jules configuration file not found at ${CONFIG_PATH}. Set JULES_API_KEY or configure keys.json.`);
+  throw new Error(`Jules configuration file not found at ${CONFIG_PATH}. Set JULES_API_KEY or configure keys.json.`);
+}
+
+function getAccounts(): Account[] {
+  const config = loadConfig();
+  if (!config.accounts || config.accounts.length === 0) {
+    throw new Error("No Jules accounts configured.");
   }
-  const raw = fs.readFileSync(CONFIG_PATH, "utf-8");
-  return JSON.parse(raw);
+  return config.accounts;
 }
 
 function getNextAccount(): { account: Account; index: number } {
@@ -77,10 +90,45 @@ async function request(endpoint: string, apiKey: string, options: https.RequestO
   });
 }
 
+// Request with automatic multi-account fallback on quota/rate-limit errors
+async function requestWithFallback(
+  endpoint: string,
+  options: https.RequestOptions = {},
+  body?: any,
+  preferredAccountName?: string
+): Promise<{ data: any; account: Account }> {
+  const accounts = getAccounts();
+  let orderedAccounts = [...accounts];
+  
+  if (preferredAccountName) {
+    const found = accounts.find(
+      (a) =>
+        (a.name && a.name.toLowerCase().includes(preferredAccountName.toLowerCase())) ||
+        (a.email && a.email.toLowerCase().includes(preferredAccountName.toLowerCase()))
+    );
+    if (found) {
+      orderedAccounts = [found, ...accounts.filter((a) => a !== found)];
+    }
+  }
+
+  let lastError: any = null;
+  for (const acc of orderedAccounts) {
+    try {
+      const data = await request(endpoint, acc.key, options, body);
+      return { data, account: acc };
+    } catch (err: any) {
+      lastError = err;
+      // If 429 quota or session not found in this account, continue to next account
+      continue;
+    }
+  }
+  throw lastError || new Error(`Operation failed across all ${accounts.length} accounts.`);
+}
+
 const server = new Server(
   {
     name: "jules-mcp",
-    version: "0.2.0",
+    version: "0.3.0",
   },
   {
     capabilities: {
@@ -94,7 +142,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     tools: [
       {
         name: "jules_list_sources",
-        description: "List all connected GitHub repositories and sources in Google Jules across accounts.",
+        description: "List all connected GitHub repositories and sources across all configured Google Jules accounts in the pool.",
         inputSchema: {
           type: "object",
           properties: {},
@@ -102,7 +150,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "jules_create_task",
-        description: "Dispatch an asynchronous coding chore, bug fix, or suggestion to Google Jules with cloud PR creation, custom branches, and plan approval options.",
+        description: "Dispatch an asynchronous coding chore, bug fix, or suggestion to Google Jules with cloud PR creation, custom branches, plan approval options, and automatic multi-account rotation.",
         inputSchema: {
           type: "object",
           properties: {
@@ -130,13 +178,30 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "boolean",
               description: "If true, Jules generates a multi-step plan first and waits for explicit approval before writing code.",
             },
+            account: {
+              type: "string",
+              description: "Optional specific account name/email to target. If omitted, uses automatic rotation with fallback.",
+            },
           },
           required: ["source", "prompt"],
         },
       },
       {
+        name: "jules_list_sessions",
+        description: "List active and historical coding sessions aggregated across all configured Google accounts.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            limit: {
+              type: "number",
+              description: "Max sessions per account (defaults to 10).",
+            },
+          },
+        },
+      },
+      {
         name: "jules_get_session",
-        description: "Retrieve full status, outputs, unidiff patches, and execution timeline for a Google Jules session.",
+        description: "Retrieve full status, outputs, unidiff patches, and execution timeline for a Google Jules session (searches across all accounts automatically).",
         inputSchema: {
           type: "object",
           properties: {
@@ -150,7 +215,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "jules_approve_plan",
-        description: "Approve a generated execution plan for a Jules session waiting in AWAITING_PLAN_APPROVAL.",
+        description: "Approve a generated execution plan for a Jules session waiting in AWAITING_PLAN_APPROVAL (auto-detects account).",
         inputSchema: {
           type: "object",
           properties: {
@@ -168,7 +233,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "jules_reply_feedback",
-        description: "Send a feedback or reply message to unblock a Jules session paused in AWAITING_USER_FEEDBACK.",
+        description: "Send a feedback or reply message to unblock a Jules session paused in AWAITING_USER_FEEDBACK (auto-detects account).",
         inputSchema: {
           type: "object",
           properties: {
@@ -200,7 +265,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "jules_archive_session",
-        description: "Archive or unarchive a Jules session to clean up the active dashboard.",
+        description: "Archive or unarchive a Jules session to clean up the active dashboard across accounts.",
         inputSchema: {
           type: "object",
           properties: {
@@ -218,7 +283,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "jules_delete_session",
-        description: "Permanently delete a Jules session.",
+        description: "Permanently delete a Jules session across accounts.",
         inputSchema: {
           type: "object",
           properties: {
@@ -249,7 +314,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "jules_pool_status",
-        description: "Check quota and active task status across all configured Jules Google accounts.",
+        description: "Check quota, active sessions, and available slots across all configured Google accounts in the pool.",
         inputSchema: {
           type: "object",
           properties: {},
@@ -265,39 +330,59 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
   try {
     switch (name) {
       case "jules_list_sources": {
-        const config = loadConfig();
+        const accounts = getAccounts();
         const results: any[] = [];
-        for (const acc of config.accounts) {
+        const seenSources = new Set<string>();
+
+        for (const acc of accounts) {
           try {
             const data = await request("sources", acc.key);
-            results.push({ account: acc.name || acc.email, sources: data.sources || [] });
+            const sources = data.sources || [];
+            results.push({
+              account: acc.name || acc.email,
+              sources: sources.map((s: any) => {
+                seenSources.add(s.name);
+                return {
+                  name: s.name,
+                  repo: `${s.githubRepo?.owner}/${s.githubRepo?.repo}`,
+                  defaultBranch: s.githubRepo?.defaultBranch?.displayName || "main",
+                };
+              }),
+            });
           } catch (err: any) {
             results.push({ account: acc.name || acc.email, error: err.message });
           }
         }
-        return { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] };
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  total_unique_sources: seenSources.size,
+                  unique_sources: Array.from(seenSources),
+                  account_breakdown: results,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
       }
 
       case "jules_create_task": {
-        const { account } = getNextAccount();
         const sourceInput = (args as any).source;
         const promptText = (args as any).prompt;
         const branch = (args as any).branch || "main";
         const workingBranch = (args as any).working_branch;
         const autoPr = (args as any).auto_create_pr !== false;
         const requirePlan = !!(args as any).require_plan_approval;
+        const preferredAccount = (args as any).account;
 
         let sourceName = sourceInput;
         if (!sourceName.startsWith("sources/")) {
-          const data = await request("sources", account.key);
-          const found = (data.sources || []).find((s: any) =>
-            s.name.toLowerCase().includes(sourceInput.toLowerCase())
-          );
-          if (found) {
-            sourceName = found.name;
-          } else {
-            sourceName = `sources/github/yasserbousrih/${sourceInput}`;
-          }
+          sourceName = `sources/github/yasserbousrih/${sourceInput}`;
         }
 
         const sourceContext: any = {
@@ -317,26 +402,57 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
           requirePlanApproval: requirePlan,
         };
 
-        const res = await request("sessions", account.key, { method: "POST" }, payload);
+        const { data: res, account: usedAccount } = await requestWithFallback(
+          "sessions",
+          { method: "POST" },
+          payload,
+          preferredAccount
+        );
+
         return {
           content: [
             {
               type: "text",
-              text: `✅ Task dispatched to Google Jules!\nAccount: ${account.name || account.email}\nSession ID: ${res.id || res.name}\nSource: ${sourceName}\nState: ${res.state || "QUEUED"}\nAuto PR: ${autoPr}\nPlan Approval Required: ${requirePlan}`,
+              text: `✅ Task dispatched to Google Jules!\nAccount: ${usedAccount.name || usedAccount.email}\nSession ID: ${res.id || res.name}\nSource: ${sourceName}\nState: ${res.state || "QUEUED"}\nAuto PR: ${autoPr}\nPlan Approval Required: ${requirePlan}`,
             },
           ],
         };
       }
 
+      case "jules_list_sessions": {
+        const limit = (args as any)?.limit || 10;
+        const accounts = getAccounts();
+        const allSessions: any[] = [];
+
+        for (const acc of accounts) {
+          try {
+            const data = await request(`sessions?pageSize=${limit}`, acc.key);
+            const sessions = (data.sessions || []).map((s: any) => ({
+              ...s,
+              account: acc.name || acc.email,
+            }));
+            allSessions.push(...sessions);
+          } catch (e: any) {
+            allSessions.push({ account: acc.name || acc.email, error: e.message });
+          }
+        }
+
+        return {
+          content: [{ type: "text", text: JSON.stringify(allSessions, null, 2) }],
+        };
+      }
+
       case "jules_get_session": {
         const sid = (args as any).session_id.replace(/^sessions\//, "");
-        const config = loadConfig();
+        const accounts = getAccounts();
         let sessionData: any = null;
         let activitiesData: any = null;
+        let ownerAccount: Account | null = null;
 
-        for (const acc of config.accounts) {
+        for (const acc of accounts) {
           try {
             sessionData = await request(`sessions/${sid}`, acc.key);
+            ownerAccount = acc;
             try {
               activitiesData = await request(`sessions/${sid}/activities`, acc.key);
             } catch {}
@@ -354,6 +470,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
               type: "text",
               text: JSON.stringify(
                 {
+                  account: ownerAccount?.name || ownerAccount?.email,
                   session: sessionData,
                   activities: activitiesData?.activities || [],
                 },
@@ -368,10 +485,10 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
       case "jules_approve_plan": {
         const sid = (args as any).session_id.replace(/^sessions\//, "");
         let planId = (args as any).plan_id;
-        const config = loadConfig();
+        const accounts = getAccounts();
 
         if (!planId) {
-          for (const acc of config.accounts) {
+          for (const acc of accounts) {
             try {
               const activitiesData = await request(`sessions/${sid}/activities`, acc.key);
               for (const act of (activitiesData.activities || []).reverse()) {
@@ -390,63 +507,37 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
           throw new Error(`No plan found to approve in session ${sid}`);
         }
 
-        let approved = false;
-        let lastErr = "";
-        for (const acc of config.accounts) {
-          try {
-            await request(
-              `sessions/${sid}:approvePlan`,
-              acc.key,
-              { method: "POST" },
-              { planId }
-            );
-            approved = true;
-            break;
-          } catch (e: any) {
-            lastErr = e.message;
-          }
-        }
-
-        if (!approved) {
-          throw new Error(`Failed to approve plan ${planId} for session ${sid}: ${lastErr}`);
-        }
+        const { account: usedAccount } = await requestWithFallback(
+          `sessions/${sid}:approvePlan`,
+          { method: "POST" },
+          { planId }
+        );
 
         return {
-          content: [{ type: "text", text: `✅ Plan ${planId} successfully approved for session ${sid}.` }],
+          content: [
+            {
+              type: "text",
+              text: `✅ Plan ${planId} successfully approved for session ${sid} (Account: ${usedAccount.name || usedAccount.email}).`,
+            },
+          ],
         };
       }
 
       case "jules_reply_feedback": {
         const sid = (args as any).session_id.replace(/^sessions\//, "");
         const msg = (args as any).message;
-        const config = loadConfig();
-        let success = false;
-        let lastErr = "";
 
-        for (const acc of config.accounts) {
-          try {
-            await request(
-              `sessions/${sid}:sendMessage`,
-              acc.key,
-              { method: "POST" },
-              { prompt: msg }
-            );
-            success = true;
-            break;
-          } catch (e: any) {
-            lastErr = e.message;
-          }
-        }
-
-        if (!success) {
-          throw new Error(`Failed to send reply to session ${sid}: ${lastErr}`);
-        }
+        const { account: usedAccount } = await requestWithFallback(
+          `sessions/${sid}:sendMessage`,
+          { method: "POST" },
+          { prompt: msg }
+        );
 
         return {
           content: [
             {
               type: "text",
-              text: `✅ Feedback reply sent to Jules session ${sid}.`,
+              text: `✅ Feedback reply sent to Jules session ${sid} (Account: ${usedAccount.name || usedAccount.email}).`,
             },
           ],
         };
@@ -454,10 +545,10 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
 
       case "jules_inspect_bash_logs": {
         const sid = (args as any).session_id.replace(/^sessions\//, "");
-        const config = loadConfig();
+        const accounts = getAccounts();
         const logs: any[] = [];
 
-        for (const acc of config.accounts) {
+        for (const acc of accounts) {
           try {
             const data = await request(`sessions/${sid}/activities`, acc.key);
             for (const act of data.activities || []) {
@@ -472,7 +563,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
                 }
               }
             }
-            break;
+            if (logs.length > 0) break;
           } catch {}
         }
 
@@ -490,51 +581,38 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
         const sid = (args as any).session_id.replace(/^sessions\//, "");
         const unarchive = !!(args as any).unarchive;
         const method = unarchive ? "unarchive" : "archive";
-        const config = loadConfig();
-        let ok = false;
-        let lastErr = "";
 
-        for (const acc of config.accounts) {
-          try {
-            await request(`sessions/${sid}:${method}`, acc.key, { method: "POST" }, {});
-            ok = true;
-            break;
-          } catch (e: any) {
-            lastErr = e.message;
-          }
-        }
-
-        if (!ok) {
-          throw new Error(`Failed to ${method} session ${sid}: ${lastErr}`);
-        }
+        const { account: usedAccount } = await requestWithFallback(
+          `sessions/${sid}:${method}`,
+          { method: "POST" },
+          {}
+        );
 
         return {
-          content: [{ type: "text", text: `✅ Session ${sid} successfully ${unarchive ? "unarchived" : "archived"}.` }],
+          content: [
+            {
+              type: "text",
+              text: `✅ Session ${sid} successfully ${unarchive ? "unarchived" : "archived"} (Account: ${usedAccount.name || usedAccount.email}).`,
+            },
+          ],
         };
       }
 
       case "jules_delete_session": {
         const sid = (args as any).session_id.replace(/^sessions\//, "");
-        const config = loadConfig();
-        let ok = false;
-        let lastErr = "";
 
-        for (const acc of config.accounts) {
-          try {
-            await request(`sessions/${sid}`, acc.key, { method: "DELETE" });
-            ok = true;
-            break;
-          } catch (e: any) {
-            lastErr = e.message;
-          }
-        }
-
-        if (!ok) {
-          throw new Error(`Failed to delete session ${sid}: ${lastErr}`);
-        }
+        const { account: usedAccount } = await requestWithFallback(
+          `sessions/${sid}`,
+          { method: "DELETE" }
+        );
 
         return {
-          content: [{ type: "text", text: `✅ Session ${sid} permanently deleted.` }],
+          content: [
+            {
+              type: "text",
+              text: `✅ Session ${sid} permanently deleted (Account: ${usedAccount.name || usedAccount.email}).`,
+            },
+          ],
         };
       }
 
@@ -548,27 +626,52 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
       }
 
       case "jules_pool_status": {
-        const config = loadConfig();
+        const accounts = getAccounts();
         const poolStatus: any[] = [];
-        for (const acc of config.accounts) {
+        let totalActive = 0;
+        let totalCompleted = 0;
+
+        for (const acc of accounts) {
           try {
             const data = await request("sessions", acc.key);
             const sessions = data.sessions || [];
-            const active = sessions.filter((s: any) => s.state === "IN_PROGRESS" || s.state === "AWAITING_USER_FEEDBACK" || s.state === "AWAITING_PLAN_APPROVAL");
+            const active = sessions.filter(
+              (s: any) =>
+                s.state === "IN_PROGRESS" ||
+                s.state === "AWAITING_USER_FEEDBACK" ||
+                s.state === "AWAITING_PLAN_APPROVAL"
+            );
             const completed = sessions.filter((s: any) => s.state === "COMPLETED");
+            totalActive += active.length;
+            totalCompleted += completed.length;
+
             poolStatus.push({
               account: acc.name || acc.email,
+              status: "ACTIVE",
               total_sessions: sessions.length,
               active_count: active.length,
               completed_count: completed.length,
-              active_sessions: active.map((s: any) => ({ id: s.id, state: s.state, title: s.title })),
+              active_sessions: active.map((s: any) => ({
+                id: s.id,
+                state: s.state,
+                title: s.title,
+              })),
             });
           } catch (e: any) {
-            poolStatus.push({ account: acc.name || acc.email, error: e.message });
+            poolStatus.push({ account: acc.name || acc.email, status: "ERROR", error: e.message });
           }
         }
+
+        const summary = {
+          total_accounts: accounts.length,
+          daily_request_capacity: accounts.length * 15,
+          active_sessions_running: totalActive,
+          completed_sessions_stored: totalCompleted,
+          accounts: poolStatus,
+        };
+
         return {
-          content: [{ type: "text", text: JSON.stringify(poolStatus, null, 2) }],
+          content: [{ type: "text", text: JSON.stringify(summary, null, 2) }],
         };
       }
 
