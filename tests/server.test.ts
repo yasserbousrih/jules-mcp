@@ -40,7 +40,7 @@ class TestMcpClient {
     await this.send("initialize", {
       protocolVersion: "2024-11-05",
       capabilities: {},
-      clientInfo: { name: "jules-test-suite", version: "1.5.0" },
+      clientInfo: { name: "jules-test-suite", version: "1.6.0" },
     });
     this.proc.stdin?.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
   }
@@ -63,16 +63,16 @@ class TestMcpClient {
   }
 }
 
-describe("Jules MCP Server & Tool Registry v1.5.0", () => {
+describe("Jules MCP Server & Tool Registry v1.6.0", () => {
   let client: TestMcpClient;
 
-  it("should initialize MCP server and register 31 tools", async () => {
+  it("should initialize MCP server and register 34 tools", async () => {
     client = new TestMcpClient();
     await client.init();
 
     const listRes = await client.send("tools/list");
     assert.ok(listRes.tools, "tools array must exist");
-    assert.equal(listRes.tools.length, 31, "Must register exactly 31 native tools");
+    assert.equal(listRes.tools.length, 34, "Must register exactly 34 native tools");
 
     const toolNames = listRes.tools.map((t: any) => t.name);
     assert.ok(toolNames.includes("jules_pool_status"));
@@ -83,6 +83,9 @@ describe("Jules MCP Server & Tool Registry v1.5.0", () => {
     assert.ok(toolNames.includes("jules_apply_patch"));
     assert.ok(toolNames.includes("jules_auto_nudge_all"));
     assert.ok(toolNames.includes("jules_check_events"));
+    assert.ok(toolNames.includes("jules_queue_status"));
+    assert.ok(toolNames.includes("jules_drain_queue"));
+    assert.ok(toolNames.includes("jules_inspect_locks"));
   });
 
   it("should query live pool status with 24h rolling quota calculation", async () => {
@@ -95,6 +98,23 @@ describe("Jules MCP Server & Tool Registry v1.5.0", () => {
     assert.ok(typeof parsed.remaining_pool_quota === "number");
     assert.ok(Array.isArray(parsed.pool));
     assert.equal(parsed.pool.length, 3);
+  });
+
+  it("should inspect persistent task queue via jules_queue_status", async () => {
+    const res = await client.callTool("jules_queue_status");
+    assert.ok(res.content && res.content.length > 0);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.ok(typeof parsed.queued_tasks_count === "number");
+    assert.ok(typeof parsed.available_pool_slots === "number");
+    assert.ok(Array.isArray(parsed.tasks));
+  });
+
+  it("should inspect active file locks via jules_inspect_locks", async () => {
+    const res = await client.callTool("jules_inspect_locks");
+    assert.ok(res.content && res.content.length > 0);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.ok(typeof parsed.total_locks === "number");
+    assert.ok(Array.isArray(parsed.locks));
   });
 
   it("should monitor live pool events and detect sessions", async () => {
@@ -147,6 +167,6 @@ describe("Jules MCP Server & Tool Registry v1.5.0", () => {
   });
 
   it("teardown client", () => {
-    client.close();
+    if (client) client.close();
   });
 });
