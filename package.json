@@ -1,14 +1,16 @@
 {
   "name": "jules-mcp",
-  "version": "0.1.0",
-  "description": "Universal MCP (Model Context Protocol) Server & CLI for Google Jules Cloud Agent - multi-account rotation, session management, and automated PR integration",
+  "version": "1.4.0",
+  "description": "Universal MCP (Model Context Protocol) Server & CLI for Google Jules Cloud Agent - multi-account rotation, session management, 3-way consolidation, and automated PR integration",
+  "type": "module",
   "main": "dist/index.js",
   "bin": {
     "jules-mcp": "./dist/index.js"
   },
   "scripts": {
     "build": "tsc",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test": "node --experimental-strip-types --test tests/server.test.ts"
   },
   "keywords": [
     "mcp",
