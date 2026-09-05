@@ -9,6 +9,7 @@ import {
 import * as fs from "fs";
 import * as path from "path";
 import * as https from "https";
+import * as os from "os";
 import { execSync } from "child_process";
 
 const CONFIG_PATH = process.env.JULES_CONFIG_PATH || path.join(process.env.HOME || "/root", ".config/jules/keys.json");
@@ -52,7 +53,7 @@ function getAccounts(): Account[] {
 async function request(endpoint: string, apiKey: string, options: https.RequestOptions = {}, body?: any): Promise<any> {
   const url = `${API_BASE}/${endpoint}${endpoint.includes("?") ? "&" : "?"}key=${apiKey}`;
   return new Promise((resolve, reject) => {
-    const req = https.request(url, { ...options, timeout: 10000 }, (res) => {
+    const req = https.request(url, { ...options, timeout: 15000 }, (res) => {
       let data = "";
       res.on("data", (chunk) => (data += chunk));
       res.on("end", () => {
@@ -115,10 +116,30 @@ async function requestWithFallback(
   throw lastError || new Error(`Operation failed across all ${accounts.length} accounts.`);
 }
 
+// Select account with lowest active load across pool
+async function getLeastLoadedAccount(): Promise<Account> {
+  const accounts = getAccounts();
+  if (accounts.length === 1) return accounts[0];
+
+  const loads: { account: Account; inFlight: number }[] = [];
+  for (const acc of accounts) {
+    try {
+      const res = await request("sessions?pageSize=20", acc.key);
+      const inFlight = (res.sessions || []).filter((s: any) => s.state === "IN_PROGRESS").length;
+      loads.push({ account: acc, inFlight });
+    } catch {
+      loads.push({ account: acc, inFlight: 99 });
+    }
+  }
+
+  loads.sort((a, b) => a.inFlight - b.inFlight);
+  return loads[0].account;
+}
+
 const server = new Server(
   {
     name: "jules-mcp",
-    version: "1.1.0",
+    version: "1.2.0",
   },
   {
     capabilities: {
@@ -175,7 +196,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "jules_dispatch_and_wait",
-        description: "Create a new Jules coding task and immediately block/wait for it in a single MCP tool call. Returns the final PR link, diff patch, or stuck question.",
+        description: "Create a new Jules coding task and immediately block/wait for it in a single MCP tool call. Automatically load-balances to the account with lowest active load. Returns final PR link, diff patch, or stuck question.",
         inputSchema: {
           type: "object",
           properties: {
@@ -209,6 +230,94 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           },
           required: ["source", "prompt"],
+        },
+      },
+      {
+        name: "jules_stream_progress",
+        description: "Extract a structured markdown progress breakdown for a session: step-by-step plan completion checklist [x], thought reasoning trail, files modified, and sandbox commands executed.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            session_id: {
+              type: "string",
+              description: "The Jules session ID to inspect.",
+            },
+          },
+          required: ["session_id"],
+        },
+      },
+      {
+        name: "jules_apply_patch",
+        description: "Fetch the clean git unidiff patch from a completed Jules session and apply it directly to a local repository workspace, with optional branch creation, test execution, and auto-commit.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            session_id: {
+              type: "string",
+              description: "The Jules session ID containing the git patch output.",
+            },
+            repo_path: {
+              type: "string",
+              description: "Absolute local repository path on this machine (e.g. '/root/projects/agent-brain').",
+            },
+            branch_name: {
+              type: "string",
+              description: "Optional branch name to create and switch to before applying (e.g. 'jules/fix-health-check').",
+            },
+            test_command: {
+              type: "string",
+              description: "Optional verification command to execute after applying patch (e.g. 'npm test' or 'pytest').",
+            },
+            auto_commit: {
+              type: "boolean",
+              description: "If true and tests pass (or no test command given), automatically commits the changes using Jules's suggested commit message (defaults to false).",
+            },
+          },
+          required: ["session_id", "repo_path"],
+        },
+      },
+      {
+        name: "jules_review_pr",
+        description: "Inspect and review a GitHub PR opened by Google Jules: pulls PR metadata, review comments, diff stats, and CI status checks via 'gh'.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            pr_url_or_number: {
+              type: "string",
+              description: "GitHub PR URL (e.g. 'https://github.com/yasserbousrih/Agent-Brain/pull/1') or PR number.",
+            },
+            repo: {
+              type: "string",
+              description: "Repository name (e.g. 'yasserbousrih/Agent-Brain'). Required if only PR number is passed.",
+            },
+          },
+          required: ["pr_url_or_number"],
+        },
+      },
+      {
+        name: "jules_merge_pr",
+        description: "Safely squash-merge a verified GitHub PR opened by Google Jules and delete the remote branch via 'gh'.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            pr_url_or_number: {
+              type: "string",
+              description: "GitHub PR URL or PR number.",
+            },
+            repo: {
+              type: "string",
+              description: "Repository name if PR number is given.",
+            },
+            merge_method: {
+              type: "string",
+              description: "Merge method: 'squash' (default), 'merge', or 'rebase'.",
+            },
+            delete_branch: {
+              type: "boolean",
+              description: "Delete remote branch after merge (defaults to true).",
+            },
+          },
+          required: ["pr_url_or_number"],
         },
       },
       {
@@ -277,7 +386,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             account: {
               type: "string",
-              description: "Optional specific account name/email to target. If omitted, uses automatic rotation with fallback.",
+              description: "Optional specific account name/email to target. If omitted, uses intelligent load-balancing.",
             },
           },
           required: ["source", "prompt"],
@@ -781,7 +890,9 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
       };
       if (title) payload.title = title;
 
-      const { data: created, account } = await requestWithFallback("sessions", { method: "POST" }, payload);
+      // Select least loaded account dynamically
+      const bestAccount = await getLeastLoadedAccount();
+      const created = await request("sessions", bestAccount.key, { method: "POST" }, payload);
       const sid = created.id || created.name?.replace("sessions/", "");
 
       // Poll / wait loop
@@ -792,11 +903,11 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
       while (Date.now() - startTime < timeoutSec * 1000) {
         await new Promise((r) => setTimeout(r, 5000));
         try {
-          sessionData = await request(`sessions/${sid}`, account.key);
+          sessionData = await request(`sessions/${sid}`, bestAccount.key);
           lastState = sessionData.state || "STATE_UNSPECIFIED";
           if (lastState === "AWAITING_PLAN_APPROVAL" && autoApprove) {
             try {
-              await request(`sessions/${sid}:approvePlan`, account.key, { method: "POST" }, {});
+              await request(`sessions/${sid}:approvePlan`, bestAccount.key, { method: "POST" }, {});
               lastState = "IN_PROGRESS (Auto-approved plan)";
             } catch {}
           } else if (["COMPLETED", "FAILED", "AWAITING_USER_FEEDBACK", "AWAITING_PLAN_APPROVAL"].includes(lastState)) {
@@ -818,7 +929,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
               {
                 session_id: sid,
                 state: lastState,
-                account: account.name || account.email,
+                account: bestAccount.name || bestAccount.email,
                 pull_request: prUrl,
                 web_url: sessionData.url || `https://jules.google.com/session/${sid}`,
               },
@@ -828,7 +939,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
           },
           {
             type: "text",
-            text: `### Task Dispatched to Google Jules\n\n• **Session ID:** \`${sid}\`\n• **Current State:** **${lastState}**\n• **Account:** ${account.name || account.email}\n` +
+            text: `### Task Dispatched to Google Jules\n\n• **Session ID:** \`${sid}\`\n• **Current State:** **${lastState}**\n• **Account:** ${bestAccount.name || bestAccount.email}\n` +
               (prUrl ? `• **Pull Request Opened:** ${prUrl}\n` : "") +
               `• **Web URL:** ${sessionData.url || `https://jules.google.com/session/${sid}`}`,
           },
@@ -837,7 +948,255 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 4: jules_list_sources
+    // TOOL 4: jules_stream_progress (Timeline Breakdown)
+    // ----------------------------------------------------
+    if (name === "jules_stream_progress") {
+      const sessionId = (args.session_id as string).replace("sessions/", "");
+      const { data: session } = await requestWithFallback(`sessions/${sessionId}`);
+      const { data: activitiesData } = await requestWithFallback(`sessions/${sessionId}/activities?pageSize=100`);
+
+      const activities = activitiesData.activities || [];
+      let planSteps: any[] = [];
+      const milestones: string[] = [];
+      const commands: string[] = [];
+
+      for (const act of activities) {
+        if (act.planGenerated && act.planGenerated.plan) {
+          planSteps = act.planGenerated.plan.steps || [];
+        }
+        if (act.progressUpdated && act.progressUpdated.title) {
+          milestones.push(`- **${act.progressUpdated.title}**: ${act.progressUpdated.description || ""}`);
+        }
+        for (const art of act.artifacts || []) {
+          if (art.bashOutput) {
+            commands.push(`\`${art.bashOutput.command}\` (exit: ${art.bashOutput.exitCode})`);
+          }
+        }
+      }
+
+      let progressMd = `## Execution Progress for Jules Session \`${sessionId}\`\n\n`;
+      progressMd += `• **Status:** **${session.state || "UNKNOWN"}**\n`;
+      progressMd += `• **Source:** \`${session.sourceContext?.source || "unknown"}\`\n`;
+      progressMd += `• **Title:** ${session.title || "Untitled"}\n\n`;
+
+      if (planSteps.length > 0) {
+        progressMd += `### Plan Steps Checklist\n`;
+        for (let i = 0; i < planSteps.length; i++) {
+          const step = planSteps[i];
+          const isDone = session.state === "COMPLETED" || i < milestones.length;
+          progressMd += `${isDone ? "- [x]" : "- [ ]"} **Step ${i + 1}:** ${step.title}\n`;
+        }
+        progressMd += `\n`;
+      }
+
+      if (milestones.length > 0) {
+        progressMd += `### Progress Milestones\n${milestones.join("\n")}\n\n`;
+      }
+
+      if (commands.length > 0) {
+        progressMd += `### Sandbox Shell Commands Executed (${commands.length})\n${commands.slice(-10).map((c) => `- ${c}`).join("\n")}\n\n`;
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: progressMd,
+          },
+        ],
+      };
+    }
+
+    // ----------------------------------------------------
+    // TOOL 5: jules_apply_patch (Direct Local Git Applier)
+    // ----------------------------------------------------
+    if (name === "jules_apply_patch") {
+      const sessionId = (args.session_id as string).replace("sessions/", "");
+      const repoPath = path.resolve(args.repo_path as string);
+      const branchName = args.branch_name as string | undefined;
+      const testCommand = args.test_command as string | undefined;
+      const autoCommit = !!args.auto_commit;
+
+      if (!fs.existsSync(repoPath) || !fs.statSync(repoPath).isDirectory()) {
+        throw new Error(`Directory does not exist: ${repoPath}`);
+      }
+
+      const { data: session } = await requestWithFallback(`sessions/${sessionId}`);
+      let gitPatch: string | null = null;
+      let commitMessage = `fix(jules): automated patch from session ${sessionId}`;
+
+      for (const out of session.outputs || []) {
+        if (out.changeSet) {
+          if (typeof out.changeSet.gitPatch === "string") {
+            gitPatch = out.changeSet.gitPatch;
+          } else if (out.changeSet.gitPatch?.unidiffPatch) {
+            gitPatch = out.changeSet.gitPatch.unidiffPatch;
+          }
+          if (out.changeSet.suggestedCommitMessage) {
+            commitMessage = out.changeSet.suggestedCommitMessage;
+          }
+        }
+      }
+
+      if (!gitPatch) {
+        throw new Error(`No git patch found in session ${sessionId}. Ensure the session is COMPLETED with outputs.`);
+      }
+
+      const patchFile = path.join(os.tmpdir(), `jules_${sessionId}.patch`);
+      fs.writeFileSync(patchFile, gitPatch, "utf-8");
+
+      let currentBranch = "main";
+      try {
+        currentBranch = execSync("git branch --show-current", { cwd: repoPath, encoding: "utf-8" }).trim();
+      } catch {}
+
+      if (branchName) {
+        execSync(`git checkout -B ${branchName}`, { cwd: repoPath, stdio: "pipe" });
+      }
+
+      // Check patch application
+      try {
+        execSync(`git apply --check ${patchFile}`, { cwd: repoPath, stdio: "pipe" });
+      } catch (err: any) {
+        throw new Error(`Git patch check failed. Workspace may have conflicts: ${err.message}`);
+      }
+
+      // Apply patch
+      execSync(`git apply ${patchFile}`, { cwd: repoPath, stdio: "pipe" });
+
+      let testOutput = null;
+      let testPassed = true;
+      if (testCommand) {
+        try {
+          testOutput = execSync(testCommand, { cwd: repoPath, encoding: "utf-8", timeout: 120000 });
+        } catch (err: any) {
+          testPassed = false;
+          testOutput = err.stdout?.toString() + "\n" + err.stderr?.toString();
+        }
+      }
+
+      let committed = false;
+      if (autoCommit && testPassed) {
+        try {
+          execSync(`git add -A && git commit -m "${commitMessage.replace(/"/g, '\\"')}"`, {
+            cwd: repoPath,
+            stdio: "pipe",
+          });
+          committed = true;
+        } catch {}
+      }
+
+      const statusOutput = execSync("git status --short", { cwd: repoPath, encoding: "utf-8" });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                status: "applied",
+                session_id: sessionId,
+                repo_path: repoPath,
+                branch: branchName || currentBranch,
+                test_passed: testPassed,
+                test_output: testOutput,
+                committed,
+                commit_message: committed ? commitMessage : null,
+                git_status: statusOutput,
+              },
+              null,
+              2
+            ),
+          },
+          {
+            type: "text",
+            text: `### Git Patch Applied from Jules Session \`${sessionId}\`\n\n` +
+              `• **Target Repo:** \`${repoPath}\`\n` +
+              `• **Branch:** \`${branchName || currentBranch}\`\n` +
+              `• **Committed:** ${committed ? `Yes (\`${commitMessage}\`)` : "No"}\n` +
+              (testCommand ? `• **Test Suite:** ${testPassed ? "Passed ✓" : "Failed ✗"}\n` : "") +
+              `\n**Modified Files:**\n\`\`\`\n${statusOutput || "(Clean - committed)"}\n\`\`\``,
+          },
+        ],
+      };
+    }
+
+    // ----------------------------------------------------
+    // TOOL 6: jules_review_pr (GitHub PR Inspector)
+    // ----------------------------------------------------
+    if (name === "jules_review_pr") {
+      const target = args.pr_url_or_number as string;
+      const repo = args.repo as string | undefined;
+
+      let cmd = `gh pr view "${target}" --json number,title,state,url,author,headRefName,baseRefName,body,comments,reviews,statusCheckRollup,additions,deletions,changedFiles`;
+      if (repo) cmd += ` --repo "${repo}"`;
+
+      try {
+        const output = execSync(cmd, { encoding: "utf-8" });
+        const pr = JSON.parse(output);
+
+        let checksMd = "";
+        for (const check of pr.statusCheckRollup || []) {
+          checksMd += `- **${check.name || check.context}**: ${check.status || check.state} (${check.conclusion || "running"})\n`;
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(pr, null, 2),
+            },
+            {
+              type: "text",
+              text: `## PR #${pr.number}: ${pr.title}\n\n` +
+                `• **Status:** ${pr.state}\n` +
+                `• **URL:** ${pr.url}\n` +
+                `• **Branch:** \`${pr.headRefName}\` -> \`${pr.baseRefName}\`\n` +
+                `• **Diff Stats:** +${pr.additions} / -${pr.deletions} across ${pr.changedFiles} files\n\n` +
+                (checksMd ? `### Status Checks\n${checksMd}\n` : "") +
+                `### Description\n${pr.body || "(No description)"}`,
+            },
+          ],
+        };
+      } catch (err: any) {
+        throw new Error(`Failed to inspect PR: ${err.stderr?.toString() || err.message}`);
+      }
+    }
+
+    // ----------------------------------------------------
+    // TOOL 7: jules_merge_pr (GitHub PR Squash-Merge)
+    // ----------------------------------------------------
+    if (name === "jules_merge_pr") {
+      const target = args.pr_url_or_number as string;
+      const repo = args.repo as string | undefined;
+      const method = (args.merge_method as string) || "squash";
+      const deleteBranch = args.delete_branch !== false;
+
+      let cmd = `gh pr merge "${target}" --${method}`;
+      if (deleteBranch) cmd += ` --delete-branch`;
+      if (repo) cmd += ` --repo "${repo}"`;
+
+      try {
+        const output = execSync(cmd, { encoding: "utf-8" });
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ success: true, target, method, output: output.trim() }, null, 2),
+            },
+            {
+              type: "text",
+              text: `### Pull Request Merged Successfully\n\n• **Target:** \`${target}\`\n• **Method:** \`${method}\`\n• **Branch Cleaned Up:** ${deleteBranch ? "Yes" : "No"}\n\n\`${output.trim()}\``,
+            },
+          ],
+        };
+      } catch (err: any) {
+        throw new Error(`Failed to merge PR: ${err.stderr?.toString() || err.message}`);
+      }
+    }
+
+    // ----------------------------------------------------
+    // TOOL 8: jules_list_sources
     // ----------------------------------------------------
     if (name === "jules_list_sources") {
       const pageSize = Number(args.page_size) || 30;
@@ -878,7 +1237,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 5: jules_get_source
+    // TOOL 9: jules_get_source
     // ----------------------------------------------------
     if (name === "jules_get_source") {
       const sourceInput = args.source as string;
@@ -898,7 +1257,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 6: jules_create_task
+    // TOOL 10: jules_create_task
     // ----------------------------------------------------
     if (name === "jules_create_task") {
       const sourceInput = args.source as string;
@@ -931,7 +1290,10 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
       if (title) payload.title = title;
       if (workingBranch) payload.sourceContext.githubRepoContext.workingBranch = workingBranch;
 
-      const { data, account } = await requestWithFallback("sessions", { method: "POST" }, payload, accountTarget);
+      const targetAccount = accountTarget ? null : await getLeastLoadedAccount();
+      const { data, account } = targetAccount
+        ? { data: await request("sessions", targetAccount.key, { method: "POST" }, payload), account: targetAccount }
+        : await requestWithFallback("sessions", { method: "POST" }, payload, accountTarget);
 
       return {
         content: [
@@ -954,7 +1316,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 7: jules_batch_dispatch
+    // TOOL 11: jules_batch_dispatch
     // ----------------------------------------------------
     if (name === "jules_batch_dispatch") {
       const tasks = args.tasks as any[];
@@ -980,12 +1342,13 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
           };
           if (t.title) payload.title = t.title;
 
-          const { data, account } = await requestWithFallback("sessions", { method: "POST" }, payload);
+          const targetAccount = await getLeastLoadedAccount();
+          const data = await request("sessions", targetAccount.key, { method: "POST" }, payload);
           results.push({
             status: "success",
             source: t.source,
             session_id: data.id || data.name?.replace("sessions/", ""),
-            account: account.name || account.email,
+            account: targetAccount.name || targetAccount.email,
             web_url: data.url || `https://jules.google.com/session/${data.id || data.name?.replace("sessions/", "")}`,
           });
         } catch (err: any) {
@@ -1008,7 +1371,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 8: jules_list_sessions
+    // TOOL 12: jules_list_sessions
     // ----------------------------------------------------
     if (name === "jules_list_sessions") {
       const state = args.state as string | undefined;
@@ -1060,7 +1423,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 9: jules_get_session
+    // TOOL 13: jules_get_session
     // ----------------------------------------------------
     if (name === "jules_get_session") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1077,7 +1440,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 10: jules_list_activities
+    // TOOL 14: jules_list_activities
     // ----------------------------------------------------
     if (name === "jules_list_activities") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1102,7 +1465,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 11: jules_get_activity
+    // TOOL 15: jules_get_activity
     // ----------------------------------------------------
     if (name === "jules_get_activity") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1121,7 +1484,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 12: jules_get_plan
+    // TOOL 16: jules_get_plan
     // ----------------------------------------------------
     if (name === "jules_get_plan") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1152,7 +1515,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 13: jules_approve_plan
+    // TOOL 17: jules_approve_plan
     // ----------------------------------------------------
     if (name === "jules_approve_plan") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1173,7 +1536,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 14: jules_reply_feedback
+    // TOOL 18: jules_reply_feedback
     // ----------------------------------------------------
     if (name === "jules_reply_feedback") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1196,7 +1559,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 15: jules_get_patch
+    // TOOL 19: jules_get_patch
     // ----------------------------------------------------
     if (name === "jules_get_patch") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1231,7 +1594,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 16: jules_inspect_bash_logs
+    // TOOL 20: jules_inspect_bash_logs
     // ----------------------------------------------------
     if (name === "jules_inspect_bash_logs") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1262,7 +1625,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 17: jules_get_media_artifacts
+    // TOOL 21: jules_get_media_artifacts
     // ----------------------------------------------------
     if (name === "jules_get_media_artifacts") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1291,7 +1654,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 18: jules_archive_session
+    // TOOL 22: jules_archive_session
     // ----------------------------------------------------
     if (name === "jules_archive_session") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1311,7 +1674,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 19: jules_delete_session
+    // TOOL 23: jules_delete_session
     // ----------------------------------------------------
     if (name === "jules_delete_session") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1328,7 +1691,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 20: jules_sync_prs
+    // TOOL 24: jules_sync_prs
     // ----------------------------------------------------
     if (name === "jules_sync_prs") {
       const sessionId = args.session_id as string | undefined;
@@ -1369,7 +1732,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 21: jules_pool_status
+    // TOOL 25: jules_pool_status
     // ----------------------------------------------------
     if (name === "jules_pool_status") {
       const accounts = getAccounts();
@@ -1442,7 +1805,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
 async function run() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  process.stderr.write("Jules MCP Server running on stdio (21 tools)\n");
+  process.stderr.write("Jules MCP Server running on stdio (25 tools)\n");
 }
 
 run().catch((error) => {
