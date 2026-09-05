@@ -1,0 +1,32 @@
+{
+  "name": "jules-mcp",
+  "version": "0.1.0",
+  "description": "Universal MCP (Model Context Protocol) Server & CLI for Google Jules Cloud Agent - multi-account rotation, session management, and automated PR integration",
+  "main": "dist/index.js",
+  "bin": {
+    "jules-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "google-jules",
+    "jules-ai",
+    "coding-agent",
+    "claude-code",
+    "cursor",
+    "hermes"
+  ],
+  "author": "Yasser Bousrih <yasserbousrih@basira.llc>",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "typescript": "^5.6.0"
+  }
+}
