@@ -1283,7 +1283,6 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
         },
         automationMode: autoCreatePr ? "AUTO_CREATE_PR" : "AUTOMATION_MODE_UNSPECIFIED",
         requirePlanApproval: !autoApprove,
-        environmentVariablesEnabled: true,
       };
       if (title) payload.title = title;
 
@@ -1398,7 +1397,6 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
         },
         automationMode: autoCreatePr ? "AUTO_CREATE_PR" : "AUTOMATION_MODE_UNSPECIFIED",
         requirePlanApproval: false,
-        environmentVariablesEnabled: true,
       };
 
       const bestAccount = await getLeastLoadedAccount();
@@ -1788,7 +1786,6 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
           },
           automationMode: "AUTO_CREATE_PR",
           requirePlanApproval: false,
-          environmentVariablesEnabled: true,
         };
 
         const targetAccount = await getLeastLoadedAccount();
@@ -2174,7 +2171,6 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
         },
         automationMode: autoCreatePr ? "AUTO_CREATE_PR" : "AUTOMATION_MODE_UNSPECIFIED",
         requirePlanApproval,
-        environmentVariablesEnabled: envVarsEnabled,
       };
 
       if (title) payload.title = title;
@@ -2243,7 +2239,6 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
             },
             automationMode: t.auto_create_pr !== false ? "AUTO_CREATE_PR" : "AUTOMATION_MODE_UNSPECIFIED",
             requirePlanApproval: !!t.require_plan_approval,
-            environmentVariablesEnabled: true,
           };
           if (t.title) payload.title = t.title;
 
