@@ -118,7 +118,6 @@ async function requestWithFallback(
       return { data, account: acc };
     } catch (err: any) {
       lastError = err;
-      // If 429 quota or session not found in this account, continue to next account
       continue;
     }
   }
@@ -128,7 +127,7 @@ async function requestWithFallback(
 const server = new Server(
   {
     name: "jules-mcp",
-    version: "0.3.0",
+    version: "1.0.0",
   },
   {
     capabilities: {
@@ -142,15 +141,29 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     tools: [
       {
         name: "jules_list_sources",
-        description: "List all connected GitHub repositories and sources across all configured Google Jules accounts in the pool.",
+        description: "List all connected GitHub repositories and sources across all configured Google Jules accounts, including branch metadata.",
         inputSchema: {
           type: "object",
           properties: {},
         },
       },
       {
+        name: "jules_get_source",
+        description: "Get detailed metadata, all available branches, default branch, and privacy status for a specific connected repository.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            source: {
+              type: "string",
+              description: "Source resource name (e.g. 'sources/github/yasserbousrih/Basria-backend') or repo name.",
+            },
+          },
+          required: ["source"],
+        },
+      },
+      {
         name: "jules_create_task",
-        description: "Dispatch an asynchronous coding chore, bug fix, or suggestion to Google Jules with cloud PR creation, custom branches, plan approval options, and automatic multi-account rotation.",
+        description: "Dispatch an asynchronous coding task, bug fix, feature, or refactoring chore to Google Jules with cloud PR creation, custom branches, plan approval, and secret/env injection.",
         inputSchema: {
           type: "object",
           properties: {
@@ -162,21 +175,29 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "string",
               description: "Instruction prompt detailing the chore, bug fix, type hints, or feature to implement.",
             },
+            title: {
+              type: "string",
+              description: "Optional custom title for the session.",
+            },
             branch: {
               type: "string",
-              description: "Target base branch name (defaults to main/master).",
+              description: "Target base starting branch (defaults to 'main' or 'master').",
             },
             working_branch: {
               type: "string",
-              description: "Optional custom branch name to push the changes to.",
+              description: "Optional custom working branch name to commit and push changes to.",
             },
             auto_create_pr: {
               type: "boolean",
-              description: "If true, Jules will automatically open a GitHub PR directly in the cloud (defaults to true).",
+              description: "If true, Jules will automatically push the branch and open a GitHub PR directly in the cloud (defaults to true).",
             },
             require_plan_approval: {
               type: "boolean",
-              description: "If true, Jules generates a multi-step plan first and waits for explicit approval before writing code.",
+              description: "If true, Jules generates a multi-step execution plan first and waits for explicit approval before writing code.",
+            },
+            environment_variables_enabled: {
+              type: "boolean",
+              description: "If true, passes repository secrets and environment variables configured in Jules to the cloud container sandbox (defaults to true).",
             },
             account: {
               type: "string",
@@ -187,21 +208,70 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
-        name: "jules_list_sessions",
-        description: "List active and historical coding sessions aggregated across all configured Google accounts.",
+        name: "jules_batch_dispatch",
+        description: "Dispatch multiple coding tasks across different repositories in parallel, load-balancing automatically across all Google accounts in the pool.",
         inputSchema: {
           type: "object",
           properties: {
+            tasks: {
+              type: "array",
+              description: "List of task objects { source: string, prompt: string, title?: string, branch?: string, auto_create_pr?: boolean, require_plan_approval?: boolean }",
+              items: {
+                type: "object",
+                properties: {
+                  source: { type: "string" },
+                  prompt: { type: "string" },
+                  title: { type: "string" },
+                  branch: { type: "string" },
+                  working_branch: { type: "string" },
+                  auto_create_pr: { type: "boolean" },
+                  require_plan_approval: { type: "boolean" },
+                },
+                required: ["source", "prompt"],
+              },
+            },
+          },
+          required: ["tasks"],
+        },
+      },
+      {
+        name: "jules_list_sessions",
+        description: "List active and historical coding sessions aggregated across all configured Google accounts with filtering by state and source.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            state: {
+              type: "string",
+              description: "Filter by state: 'IN_PROGRESS', 'AWAITING_USER_FEEDBACK', 'AWAITING_PLAN_APPROVAL', 'COMPLETED', 'FAILED', or 'ALL'.",
+            },
+            source: {
+              type: "string",
+              description: "Filter sessions by repository / source name.",
+            },
             limit: {
               type: "number",
-              description: "Max sessions per account (defaults to 10).",
+              description: "Max sessions per account (defaults to 20).",
             },
           },
         },
       },
       {
         name: "jules_get_session",
-        description: "Retrieve full status, outputs, unidiff patches, and execution timeline for a Google Jules session (searches across all accounts automatically).",
+        description: "Retrieve full status, PR URL, git diff patches, cloud URL, and execution timeline for a Google Jules session (searches across all accounts automatically).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            session_id: {
+              type: "string",
+              description: "The unique Jules session ID.",
+            },
+          },
+          required: ["session_id"],
+        },
+      },
+      {
+        name: "jules_get_plan",
+        description: "Extract the generated step-by-step execution plan from a Jules session.",
         inputSchema: {
           type: "object",
           properties: {
@@ -215,7 +285,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "jules_approve_plan",
-        description: "Approve a generated execution plan for a Jules session waiting in AWAITING_PLAN_APPROVAL (auto-detects account).",
+        description: "Approve a generated execution plan for a Jules session waiting in AWAITING_PLAN_APPROVAL to let Jules proceed with coding.",
         inputSchema: {
           type: "object",
           properties: {
@@ -233,7 +303,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "jules_reply_feedback",
-        description: "Send a feedback or reply message to unblock a Jules session paused in AWAITING_USER_FEEDBACK (auto-detects account).",
+        description: "Send a message or reply to unblock a Jules session paused in AWAITING_USER_FEEDBACK or provide iterative follow-up instructions.",
         inputSchema: {
           type: "object",
           properties: {
@@ -250,8 +320,36 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "jules_get_patch",
+        description: "Extract the unidiff git patch, base commit ID, and suggested commit message produced by a completed Jules session.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            session_id: {
+              type: "string",
+              description: "The unique Jules session ID.",
+            },
+          },
+          required: ["session_id"],
+        },
+      },
+      {
         name: "jules_inspect_bash_logs",
-        description: "Inspect raw bash commands, exit codes, and stdout/stderr execution outputs produced by Jules in the cloud sandbox.",
+        description: "Inspect raw bash commands, exit codes, and stdout/stderr execution outputs produced by Jules inside the Google Cloud sandbox container.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            session_id: {
+              type: "string",
+              description: "The unique Jules session ID.",
+            },
+          },
+          required: ["session_id"],
+        },
+      },
+      {
+        name: "jules_get_media_artifacts",
+        description: "Extract screenshots, images, videos, or diagrams produced by Jules during container test runs and UI executions.",
         inputSchema: {
           type: "object",
           properties: {
@@ -265,7 +363,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "jules_archive_session",
-        description: "Archive or unarchive a Jules session to clean up the active dashboard across accounts.",
+        description: "Archive or unarchive a Jules session to organize the active dashboard.",
         inputSchema: {
           type: "object",
           properties: {
@@ -297,7 +395,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "jules_sync_prs",
-        description: "Extract completed patches from Jules sessions and automatically create verified GitHub Pull Requests locally.",
+        description: "Extract completed patches from Jules sessions and automatically create verified GitHub Pull Requests locally via GitHub CLI.",
         inputSchema: {
           type: "object",
           properties: {
@@ -346,6 +444,8 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
                   name: s.name,
                   repo: `${s.githubRepo?.owner}/${s.githubRepo?.repo}`,
                   defaultBranch: s.githubRepo?.defaultBranch?.displayName || "main",
+                  branches: (s.githubRepo?.branches || []).map((b: any) => b.displayName),
+                  isPrivate: s.githubRepo?.isPrivate,
                 };
               }),
             });
@@ -371,13 +471,51 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
         };
       }
 
+      case "jules_get_source": {
+        const sourceInput = (args as any).source.replace(/^sources\//, "");
+        const accounts = getAccounts();
+        let sourceData: any = null;
+        let ownerAccount: Account | null = null;
+
+        for (const acc of accounts) {
+          try {
+            const fullSourceName = sourceInput.includes("/") ? `sources/${sourceInput}` : `sources/github/yasserbousrih/${sourceInput}`;
+            sourceData = await request(fullSourceName, acc.key);
+            ownerAccount = acc;
+            break;
+          } catch {}
+        }
+
+        if (!sourceData) {
+          throw new Error(`Source ${sourceInput} not found in any configured Jules account.`);
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  account: ownerAccount?.name || ownerAccount?.email,
+                  source: sourceData,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
       case "jules_create_task": {
         const sourceInput = (args as any).source;
         const promptText = (args as any).prompt;
+        const titleText = (args as any).title;
         const branch = (args as any).branch || "main";
         const workingBranch = (args as any).working_branch;
         const autoPr = (args as any).auto_create_pr !== false;
         const requirePlan = !!(args as any).require_plan_approval;
+        const envVarsEnabled = (args as any).environment_variables_enabled !== false;
         const preferredAccount = (args as any).account;
 
         let sourceName = sourceInput;
@@ -390,17 +528,21 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
           githubRepoContext: {
             startingBranch: branch,
           },
+          environmentVariablesEnabled: envVarsEnabled,
         };
         if (workingBranch) {
           sourceContext.workingBranch = workingBranch;
         }
 
-        const payload = {
+        const payload: any = {
           prompt: promptText,
           sourceContext,
           automationMode: autoPr ? "AUTO_CREATE_PR" : "AUTOMATION_MODE_UNSPECIFIED",
           requirePlanApproval: requirePlan,
         };
+        if (titleText) {
+          payload.title = titleText;
+        }
 
         const { data: res, account: usedAccount } = await requestWithFallback(
           "sessions",
@@ -413,16 +555,91 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
           content: [
             {
               type: "text",
-              text: `✅ Task dispatched to Google Jules!\nAccount: ${usedAccount.name || usedAccount.email}\nSession ID: ${res.id || res.name}\nSource: ${sourceName}\nState: ${res.state || "QUEUED"}\nAuto PR: ${autoPr}\nPlan Approval Required: ${requirePlan}`,
+              text: `✅ Task dispatched to Google Jules!\nAccount: ${usedAccount.name || usedAccount.email}\nSession ID: ${res.id || res.name}\nSource: ${sourceName}\nStarting Branch: ${branch}\nState: ${res.state || "QUEUED"}\nAuto PR: ${autoPr}\nPlan Approval Required: ${requirePlan}\nWeb URL: ${res.url || `https://jules.google.com/session/${res.id}`}`,
+            },
+          ],
+        };
+      }
+
+      case "jules_batch_dispatch": {
+        const tasks = (args as any).tasks || [];
+        const results: any[] = [];
+
+        for (const task of tasks) {
+          try {
+            const { account } = getNextAccount();
+            let sourceName = task.source;
+            if (!sourceName.startsWith("sources/")) {
+              sourceName = `sources/github/yasserbousrih/${task.source}`;
+            }
+
+            const sourceContext: any = {
+              source: sourceName,
+              githubRepoContext: {
+                startingBranch: task.branch || "main",
+              },
+              environmentVariablesEnabled: true,
+            };
+            if (task.working_branch) {
+              sourceContext.workingBranch = task.working_branch;
+            }
+
+            const payload: any = {
+              prompt: task.prompt,
+              sourceContext,
+              automationMode: task.auto_create_pr !== false ? "AUTO_CREATE_PR" : "AUTOMATION_MODE_UNSPECIFIED",
+              requirePlanApproval: !!task.require_plan_approval,
+            };
+            if (task.title) {
+              payload.title = task.title;
+            }
+
+            const { data: res, account: usedAccount } = await requestWithFallback(
+              "sessions",
+              { method: "POST" },
+              payload,
+              account.name || account.email
+            );
+
+            results.push({
+              source: task.source,
+              session_id: res.id || res.name,
+              account: usedAccount.name || usedAccount.email,
+              state: res.state || "QUEUED",
+              url: res.url,
+            });
+          } catch (e: any) {
+            results.push({
+              source: task.source,
+              error: e.message,
+            });
+          }
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  dispatched_count: results.filter((r) => !r.error).length,
+                  failed_count: results.filter((r) => r.error).length,
+                  results,
+                },
+                null,
+                2
+              ),
             },
           ],
         };
       }
 
       case "jules_list_sessions": {
-        const limit = (args as any)?.limit || 10;
+        const limit = (args as any)?.limit || 20;
+        const stateFilter = (args as any)?.state?.toUpperCase();
+        const sourceFilter = (args as any)?.source?.toLowerCase();
         const accounts = getAccounts();
-        const allSessions: any[] = [];
+        let allSessions: any[] = [];
 
         for (const acc of accounts) {
           try {
@@ -435,6 +652,18 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
           } catch (e: any) {
             allSessions.push({ account: acc.name || acc.email, error: e.message });
           }
+        }
+
+        if (stateFilter && stateFilter !== "ALL") {
+          allSessions = allSessions.filter((s: any) => s.state === stateFilter);
+        }
+
+        if (sourceFilter) {
+          allSessions = allSessions.filter(
+            (s: any) =>
+              s.sourceContext?.source?.toLowerCase().includes(sourceFilter) ||
+              s.title?.toLowerCase().includes(sourceFilter)
+          );
         }
 
         return {
@@ -472,6 +701,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
                 {
                   account: ownerAccount?.name || ownerAccount?.email,
                   session: sessionData,
+                  activities_count: activitiesData?.activities?.length || 0,
                   activities: activitiesData?.activities || [],
                 },
                 null,
@@ -479,6 +709,33 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
               ),
             },
           ],
+        };
+      }
+
+      case "jules_get_plan": {
+        const sid = (args as any).session_id.replace(/^sessions\//, "");
+        const accounts = getAccounts();
+        let plan: any = null;
+
+        for (const acc of accounts) {
+          try {
+            const activitiesData = await request(`sessions/${sid}/activities`, acc.key);
+            for (const act of (activitiesData.activities || []).reverse()) {
+              if (act.planGenerated?.plan) {
+                plan = act.planGenerated.plan;
+                break;
+              }
+            }
+            if (plan) break;
+          } catch {}
+        }
+
+        if (!plan) {
+          throw new Error(`No plan found for session ${sid}.`);
+        }
+
+        return {
+          content: [{ type: "text", text: JSON.stringify(plan, null, 2) }],
         };
       }
 
@@ -543,6 +800,44 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
         };
       }
 
+      case "jules_get_patch": {
+        const sid = (args as any).session_id.replace(/^sessions\//, "");
+        const accounts = getAccounts();
+        let sessionData: any = null;
+
+        for (const acc of accounts) {
+          try {
+            sessionData = await request(`sessions/${sid}`, acc.key);
+            break;
+          } catch {}
+        }
+
+        if (!sessionData) {
+          throw new Error(`Session ${sid} not found.`);
+        }
+
+        let patchInfo: any = null;
+        for (const out of sessionData.outputs || []) {
+          if (out.changeSet?.gitPatch) {
+            patchInfo = out.changeSet.gitPatch;
+            break;
+          }
+        }
+
+        if (!patchInfo) {
+          throw new Error(`No git patch output found for session ${sid} (current state: ${sessionData.state}).`);
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(patchInfo, null, 2),
+            },
+          ],
+        };
+      }
+
       case "jules_inspect_bash_logs": {
         const sid = (args as any).session_id.replace(/^sessions\//, "");
         const accounts = getAccounts();
@@ -572,6 +867,40 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
             {
               type: "text",
               text: logs.length ? JSON.stringify(logs, null, 2) : `No bash execution logs found for session ${sid}.`,
+            },
+          ],
+        };
+      }
+
+      case "jules_get_media_artifacts": {
+        const sid = (args as any).session_id.replace(/^sessions\//, "");
+        const accounts = getAccounts();
+        const mediaList: any[] = [];
+
+        for (const acc of accounts) {
+          try {
+            const data = await request(`sessions/${sid}/activities`, acc.key);
+            for (const act of data.activities || []) {
+              for (const art of act.artifacts || []) {
+                if (art.media) {
+                  mediaList.push({
+                    time: act.createTime,
+                    description: act.description,
+                    mimeType: art.media.mimeType,
+                    dataPreview: art.media.data ? `${art.media.data.slice(0, 100)}...` : null,
+                  });
+                }
+              }
+            }
+            if (mediaList.length > 0) break;
+          } catch {}
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: mediaList.length ? JSON.stringify(mediaList, null, 2) : `No media artifacts found for session ${sid}.`,
             },
           ],
         };
