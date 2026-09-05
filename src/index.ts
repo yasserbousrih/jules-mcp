@@ -141,10 +141,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     tools: [
       {
         name: "jules_list_sources",
-        description: "List all connected GitHub repositories and sources across all configured Google Jules accounts, including branch metadata.",
+        description: "List all connected GitHub repositories and sources across all configured Google Jules accounts, including branch metadata, pagination, and AIP-160 filter support.",
         inputSchema: {
           type: "object",
-          properties: {},
+          properties: {
+            page_size: { type: "number", description: "Number of sources to return per account (1-100, default 30)" },
+            page_token: { type: "string", description: "Page token for pagination" },
+            filter: { type: "string", description: "AIP-160 filter expression for sources" },
+          },
         },
       },
       {
@@ -215,7 +219,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             tasks: {
               type: "array",
-              description: "List of task objects { source: string, prompt: string, title?: string, branch?: string, auto_create_pr?: boolean, require_plan_approval?: boolean }",
+              description: "List of task objects { source: string, prompt: string, title?: string, branch?: string, working_branch?: string, auto_create_pr?: boolean, require_plan_approval?: boolean }",
               items: {
                 type: "object",
                 properties: {
@@ -236,7 +240,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "jules_list_sessions",
-        description: "List active and historical coding sessions aggregated across all configured Google accounts with filtering by state and source.",
+        description: "List active and historical coding sessions aggregated across all configured Google accounts with filtering by state, source, AIP-160 filter expressions, and pagination.",
         inputSchema: {
           type: "object",
           properties: {
@@ -248,9 +252,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "string",
               description: "Filter sessions by repository / source name.",
             },
+            filter: {
+              type: "string",
+              description: "AIP-160 filter expression for sessions.",
+            },
             limit: {
               type: "number",
               description: "Max sessions per account (defaults to 20).",
+            },
+            page_token: {
+              type: "string",
+              description: "Pagination page token.",
             },
           },
         },
@@ -267,6 +279,50 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           },
           required: ["session_id"],
+        },
+      },
+      {
+        name: "jules_list_activities",
+        description: "List full granular activities (agent messages, progress updates, bash outputs, plan events) for a specific session with pagination and AIP-160 filter.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            session_id: {
+              type: "string",
+              description: "The unique Jules session ID.",
+            },
+            page_size: {
+              type: "number",
+              description: "Number of activities to return (1-100, default 50).",
+            },
+            page_token: {
+              type: "string",
+              description: "Page token for pagination.",
+            },
+            filter: {
+              type: "string",
+              description: "AIP-160 filter expression for activities.",
+            },
+          },
+          required: ["session_id"],
+        },
+      },
+      {
+        name: "jules_get_activity",
+        description: "Retrieve a specific single activity by session ID and activity ID.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            session_id: {
+              type: "string",
+              description: "The unique Jules session ID.",
+            },
+            activity_id: {
+              type: "string",
+              description: "The unique activity ID or full activity name (e.g. 'sessions/123/activities/456').",
+            },
+          },
+          required: ["session_id", "activity_id"],
         },
       },
       {
@@ -428,16 +484,24 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
   try {
     switch (name) {
       case "jules_list_sources": {
+        const pageSize = (args as any)?.page_size || 30;
+        const pageToken = (args as any)?.page_token;
+        const filter = (args as any)?.filter;
         const accounts = getAccounts();
         const results: any[] = [];
         const seenSources = new Set<string>();
 
         for (const acc of accounts) {
           try {
-            const data = await request("sources", acc.key);
+            let endpoint = `sources?pageSize=${pageSize}`;
+            if (pageToken) endpoint += `&pageToken=${encodeURIComponent(pageToken)}`;
+            if (filter) endpoint += `&filter=${encodeURIComponent(filter)}`;
+
+            const data = await request(endpoint, acc.key);
             const sources = data.sources || [];
             results.push({
               account: acc.name || acc.email,
+              nextPageToken: data.nextPageToken,
               sources: sources.map((s: any) => {
                 seenSources.add(s.name);
                 return {
@@ -638,12 +702,18 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
         const limit = (args as any)?.limit || 20;
         const stateFilter = (args as any)?.state?.toUpperCase();
         const sourceFilter = (args as any)?.source?.toLowerCase();
+        const aipFilter = (args as any)?.filter;
+        const pageToken = (args as any)?.page_token;
         const accounts = getAccounts();
         let allSessions: any[] = [];
 
         for (const acc of accounts) {
           try {
-            const data = await request(`sessions?pageSize=${limit}`, acc.key);
+            let endpoint = `sessions?pageSize=${limit}`;
+            if (pageToken) endpoint += `&pageToken=${encodeURIComponent(pageToken)}`;
+            if (aipFilter) endpoint += `&filter=${encodeURIComponent(aipFilter)}`;
+
+            const data = await request(endpoint, acc.key);
             const sessions = (data.sessions || []).map((s: any) => ({
               ...s,
               account: acc.name || acc.email,
@@ -683,7 +753,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
             sessionData = await request(`sessions/${sid}`, acc.key);
             ownerAccount = acc;
             try {
-              activitiesData = await request(`sessions/${sid}/activities`, acc.key);
+              activitiesData = await request(`sessions/${sid}/activities?pageSize=50`, acc.key);
             } catch {}
             break;
           } catch {}
@@ -712,6 +782,87 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
         };
       }
 
+      case "jules_list_activities": {
+        const sid = (args as any).session_id.replace(/^sessions\//, "");
+        const pageSize = (args as any)?.page_size || 50;
+        const pageToken = (args as any)?.page_token;
+        const filter = (args as any)?.filter;
+        const accounts = getAccounts();
+        let activitiesData: any = null;
+        let ownerAccount: Account | null = null;
+
+        for (const acc of accounts) {
+          try {
+            let endpoint = `sessions/${sid}/activities?pageSize=${pageSize}`;
+            if (pageToken) endpoint += `&pageToken=${encodeURIComponent(pageToken)}`;
+            if (filter) endpoint += `&filter=${encodeURIComponent(filter)}`;
+
+            activitiesData = await request(endpoint, acc.key);
+            ownerAccount = acc;
+            break;
+          } catch {}
+        }
+
+        if (!activitiesData) {
+          throw new Error(`Could not list activities for session ${sid}.`);
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  session_id: sid,
+                  account: ownerAccount?.name || ownerAccount?.email,
+                  activities_count: activitiesData.activities?.length || 0,
+                  nextPageToken: activitiesData.nextPageToken,
+                  activities: activitiesData.activities || [],
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      case "jules_get_activity": {
+        const sid = (args as any).session_id.replace(/^sessions\//, "");
+        let actId = (args as any).activity_id.replace(/^sessions\/[^/]+\/activities\//, "");
+        const accounts = getAccounts();
+        let actData: any = null;
+        let ownerAccount: Account | null = null;
+
+        for (const acc of accounts) {
+          try {
+            actData = await request(`sessions/${sid}/activities/${actId}`, acc.key);
+            ownerAccount = acc;
+            break;
+          } catch {}
+        }
+
+        if (!actData) {
+          throw new Error(`Activity ${actId} not found in session ${sid}.`);
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  account: ownerAccount?.name || ownerAccount?.email,
+                  activity: actData,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
       case "jules_get_plan": {
         const sid = (args as any).session_id.replace(/^sessions\//, "");
         const accounts = getAccounts();
@@ -719,7 +870,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
 
         for (const acc of accounts) {
           try {
-            const activitiesData = await request(`sessions/${sid}/activities`, acc.key);
+            const activitiesData = await request(`sessions/${sid}/activities?pageSize=50`, acc.key);
             for (const act of (activitiesData.activities || []).reverse()) {
               if (act.planGenerated?.plan) {
                 plan = act.planGenerated.plan;
@@ -747,7 +898,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
         if (!planId) {
           for (const acc of accounts) {
             try {
-              const activitiesData = await request(`sessions/${sid}/activities`, acc.key);
+              const activitiesData = await request(`sessions/${sid}/activities?pageSize=50`, acc.key);
               for (const act of (activitiesData.activities || []).reverse()) {
                 const p = act.planGenerated?.plan;
                 if (p?.id) {
@@ -845,7 +996,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
 
         for (const acc of accounts) {
           try {
-            const data = await request(`sessions/${sid}/activities`, acc.key);
+            const data = await request(`sessions/${sid}/activities?pageSize=100`, acc.key);
             for (const act of data.activities || []) {
               for (const art of act.artifacts || []) {
                 if (art.bashOutput) {
@@ -879,7 +1030,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestCall) => {
 
         for (const acc of accounts) {
           try {
-            const data = await request(`sessions/${sid}/activities`, acc.key);
+            const data = await request(`sessions/${sid}/activities?pageSize=100`, acc.key);
             for (const act of data.activities || []) {
               for (const art of act.artifacts || []) {
                 if (art.media) {
