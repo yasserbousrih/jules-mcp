@@ -10,7 +10,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as https from "https";
 import * as os from "os";
-import { execSync } from "child_process";
+import { execSync, execFileSync } from "child_process";
 
 const CONFIG_PATH = process.env.JULES_CONFIG_PATH || path.join(process.env.HOME || "/root", ".config/jules/keys.json");
 const USAGE_PATH = process.env.JULES_USAGE_PATH || path.join(process.env.HOME || "/root", ".config/jules/usage.json");
@@ -370,7 +370,17 @@ async function request(endpoint: string, apiKey: string, options: https.RequestO
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       return await new Promise((resolve, reject) => {
-        const req = https.request(url, { ...options, timeout: 20000 }, (res) => {
+        const req = https.request(
+          url,
+          {
+            ...options,
+            timeout: 20000,
+            headers: {
+              ...(options.headers || {}),
+              "x-goog-api-key": apiKey,
+            },
+          },
+          (res) => {
           let data = "";
           res.on("data", (chunk) => (data += chunk));
           res.on("end", () => {
@@ -1943,10 +1953,11 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
           const prBody = `## Consolidated Jules Cloud Chores\\n\\nMerged ${appliedSessions.length} sessions cleanly with local 3-way reconciliation:\\n` +
             appliedSessions.map((s) => `- \`${s.session_id}\`: ${s.title}`).join("\\n") +
             `\\n\\n**Test Suite:** Passed ✓`;
-          const prOut = execSync(`gh pr create --title "${prTitle}" --body "${prBody}" --base ${baseBranch} --head ${targetBranch}`, {
-            cwd: repoPath,
-            encoding: "utf-8",
-          });
+          const prOut = execFileSync(
+            "gh",
+            ["pr", "create", "--title", prTitle, "--body", prBody, "--base", baseBranch, "--head", targetBranch],
+            { cwd: repoPath, encoding: "utf-8" }
+          );
           prUrl = prOut.trim();
         } catch {}
       }
@@ -1999,16 +2010,19 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
       }
 
       try {
-        const prView = execSync(`gh pr view "${prTarget}" --json headRefName,baseRefName,url`, {
-          cwd: repoPath,
-          encoding: "utf-8",
-        });
+        const prView = execFileSync(
+          "gh",
+          ["pr", "view", prTarget, "--json", "headRefName,baseRefName,url"],
+          { cwd: repoPath, encoding: "utf-8" }
+        );
         const pr = JSON.parse(prView);
         const headBranch = pr.headRefName;
 
-        execSync(`git fetch origin ${headBranch} && git checkout ${headBranch}`, { cwd: repoPath, stdio: "pipe" });
-        execSync(`git fetch origin ${baseBranch} && git rebase origin/${baseBranch}`, { cwd: repoPath, stdio: "pipe" });
-        execSync(`git push origin ${headBranch} --force-with-lease`, { cwd: repoPath, stdio: "pipe" });
+        execFileSync("git", ["fetch", "origin", headBranch], { cwd: repoPath, stdio: "pipe" });
+        execFileSync("git", ["checkout", headBranch], { cwd: repoPath, stdio: "pipe" });
+        execFileSync("git", ["fetch", "origin", baseBranch], { cwd: repoPath, stdio: "pipe" });
+        execFileSync("git", ["rebase", `origin/${baseBranch}`], { cwd: repoPath, stdio: "pipe" });
+        execFileSync("git", ["push", "origin", headBranch, "--force-with-lease"], { cwd: repoPath, stdio: "pipe" });
 
         return {
           content: [
@@ -2278,11 +2292,17 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
       const target = args.pr_url_or_number as string;
       const repo = args.repo as string | undefined;
 
-      let cmd = `gh pr view "${target}" --json number,title,state,url,author,headRefName,baseRefName,body,comments,reviews,statusCheckRollup,additions,deletions,changedFiles`;
-      if (repo) cmd += ` --repo "${repo}"`;
+      const ghArgs = [
+        "pr",
+        "view",
+        target,
+        "--json",
+        "number,title,state,url,author,headRefName,baseRefName,body,comments,reviews,statusCheckRollup,additions,deletions,changedFiles",
+      ];
+      if (repo) ghArgs.push("--repo", repo);
 
       try {
-        const output = execSync(cmd, { encoding: "utf-8" });
+        const output = execFileSync("gh", ghArgs, { encoding: "utf-8" });
         const pr = JSON.parse(output);
 
         let checksMd = "";
@@ -2322,12 +2342,12 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
       const method = (args.merge_method as string) || "squash";
       const deleteBranch = args.delete_branch !== false;
 
-      let cmd = `gh pr merge "${target}" --${method}`;
-      if (deleteBranch) cmd += ` --delete-branch`;
-      if (repo) cmd += ` --repo "${repo}"`;
+      const ghArgs = ["pr", "merge", target, `--${method}`];
+      if (deleteBranch) ghArgs.push("--delete-branch");
+      if (repo) ghArgs.push("--repo", repo);
 
       try {
-        const output = execSync(cmd, { encoding: "utf-8" });
+        const output = execFileSync("gh", ghArgs, { encoding: "utf-8" });
         return {
           content: [
             {
@@ -2880,8 +2900,8 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
 
       if (fs.existsSync(scriptPath)) {
         try {
-          const cmd = sessionId ? `${scriptPath} --session ${sessionId}` : scriptPath;
-          const output = execSync(cmd, { encoding: "utf-8", timeout: 120000 });
+          const syncArgs = sessionId ? ["--session", sessionId] : [];
+          const output = execFileSync(scriptPath, syncArgs, { encoding: "utf-8", timeout: 120000 });
           return {
             content: [
               {
