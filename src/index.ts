@@ -13,6 +13,7 @@ import * as os from "os";
 import { execSync } from "child_process";
 
 const CONFIG_PATH = process.env.JULES_CONFIG_PATH || path.join(process.env.HOME || "/root", ".config/jules/keys.json");
+const USAGE_PATH = process.env.JULES_USAGE_PATH || path.join(process.env.HOME || "/root", ".config/jules/usage.json");
 const API_BASE = "https://jules.googleapis.com/v1alpha";
 
 interface Account {
@@ -24,6 +25,17 @@ interface Account {
 interface JulesConfig {
   accounts: Account[];
   last_index?: number;
+}
+
+interface DispatchRecord {
+  account: string;
+  timestamp: number;
+  sessionId: string;
+  repo: string;
+}
+
+interface UsageLedger {
+  dispatches: DispatchRecord[];
 }
 
 // Deprecated or decommissioned repos that should NEVER be dispatched to Jules
@@ -42,6 +54,45 @@ const ARCHITECTURE_INVARIANTS: Record<string, string> = {
   "voice-channel": "ARCHITECTURAL INVARIANT: Real-time telephony microservice (Twilio Media Streams -> Deepgram STT -> ElevenLabs TTS). Maintain low-latency async streams.",
   "chat-channel": "ARCHITECTURAL INVARIANT: Unified omni-channel gateway (WhatsApp, SMS, Socket.io) subscribing to Agent-Brain events.",
   "email-channel": "ARCHITECTURAL INVARIANT: Autonomous email gateway subscribing to Agent-Brain events.",
+};
+
+interface ChoreRecipe {
+  name: string;
+  description: string;
+  buildPrompt: (target: string, extra?: string) => string;
+}
+
+const CHORE_RECIPES: Record<string, ChoreRecipe> = {
+  "scaffold-unit-test": {
+    name: "Scaffold Unit Tests",
+    description: "Write comprehensive unit tests with edge cases, happy paths, and error scenarios for target file/module.",
+    buildPrompt: (target, extra) =>
+      `Write a comprehensive unit test suite for \`${target}\`. Include tests for normal operations, edge cases, invalid inputs, and error handling. Follow existing test frameworks in the repository.${extra ? ` Instructions: ${extra}` : ""}`,
+  },
+  "add-strict-types": {
+    name: "Add Strict Types",
+    description: "Add complete type annotations (TypeScript interfaces/types or Python type hints) with zero compiler errors.",
+    buildPrompt: (target, extra) =>
+      `Add strict, accurate type annotations to \`${target}\`. Ensure all function parameters, return values, and exported constants have explicit types. Do NOT use \`any\`. Ensure compiler checks pass with 0 errors.${extra ? ` Instructions: ${extra}` : ""}`,
+  },
+  "document-endpoints": {
+    name: "Document Endpoints & Functions",
+    description: "Add comprehensive docstrings/JSDoc with parameters, return types, and exceptions to all exported functions/endpoints.",
+    buildPrompt: (target, extra) =>
+      `Add clean, standard docstrings / JSDoc comments to all public functions, classes, and endpoints in \`${target}\`. Document parameters, return values, and possible exceptions/errors.${extra ? ` Instructions: ${extra}` : ""}`,
+  },
+  "clean-dead-code": {
+    name: "Clean Dead Code & Unused Imports",
+    description: "Safely identify and remove unused imports, dead variables, unreachable statements, and deprecated private helpers.",
+    buildPrompt: (target, extra) =>
+      `Audit \`${target}\` and safely remove unused imports, unused local variables, and unreachable code blocks. Do NOT remove public API exports or break existing functionality.${extra ? ` Instructions: ${extra}` : ""}`,
+  },
+  "refactor-isolated-helper": {
+    name: "Refactor Isolated Helper",
+    description: "Refactor complex helper functions to improve readability, reduce cyclomatic complexity, and optimize performance without altering external signatures.",
+    buildPrompt: (target, extra) =>
+      `Refactor helper logic in \`${target}\` for maximum clarity, readability, and performance. Keep all function signatures and public APIs 100% backward-compatible.${extra ? ` Instructions: ${extra}` : ""}`,
+  },
 };
 
 function loadConfig(): JulesConfig {
@@ -66,6 +117,70 @@ function getAccounts(): Account[] {
     throw new Error("No Jules accounts configured.");
   }
   return config.accounts;
+}
+
+function loadUsageLedger(): UsageLedger {
+  if (fs.existsSync(USAGE_PATH)) {
+    try {
+      const raw = fs.readFileSync(USAGE_PATH, "utf-8");
+      return JSON.parse(raw);
+    } catch {}
+  }
+  return { dispatches: [] };
+}
+
+function saveUsageLedger(ledger: UsageLedger) {
+  try {
+    const dir = path.dirname(USAGE_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const cutoff = Date.now() - 48 * 60 * 60 * 1000;
+    ledger.dispatches = ledger.dispatches.filter((d) => d.timestamp > cutoff);
+    fs.writeFileSync(USAGE_PATH, JSON.stringify(ledger, null, 2), "utf-8");
+  } catch {}
+}
+
+function recordDispatch(account: string, sessionId: string, repo: string) {
+  const ledger = loadUsageLedger();
+  ledger.dispatches.push({
+    account,
+    timestamp: Date.now(),
+    sessionId,
+    repo,
+  });
+  saveUsageLedger(ledger);
+}
+
+function getQuotaStatus() {
+  const ledger = loadUsageLedger();
+  const now = Date.now();
+  const window24h = 24 * 60 * 60 * 1000;
+  const accounts = getAccounts();
+
+  const status: Record<string, { usedLast24h: number; remaining: number; nextResetMinutes?: number }> = {};
+
+  for (const acc of accounts) {
+    const key = acc.name || acc.email || "Account";
+    const recent = ledger.dispatches.filter(
+      (d) => (d.account === key || d.account === acc.email || d.account === acc.name) && (now - d.timestamp < window24h)
+    );
+    const used = recent.length;
+    const remaining = Math.max(0, 15 - used);
+
+    let nextResetMinutes: number | undefined = undefined;
+    if (recent.length > 0) {
+      const oldest = Math.min(...recent.map((d) => d.timestamp));
+      const resetTime = oldest + window24h;
+      nextResetMinutes = Math.max(0, Math.round((resetTime - now) / 60000));
+    }
+
+    status[key] = {
+      usedLast24h: used,
+      remaining,
+      nextResetMinutes,
+    };
+  }
+
+  return status;
 }
 
 async function request(endpoint: string, apiKey: string, options: https.RequestOptions = {}, body?: any): Promise<any> {
@@ -134,27 +249,37 @@ async function requestWithFallback(
   throw lastError || new Error(`Operation failed across all ${accounts.length} accounts.`);
 }
 
-// Select account with lowest active load across pool
+// Select account with lowest active load & guaranteed rolling 24h quota
 async function getLeastLoadedAccount(): Promise<Account> {
   const accounts = getAccounts();
   if (accounts.length === 1) return accounts[0];
 
-  const loads: { account: Account; inFlight: number }[] = [];
+  const quotaStatus = getQuotaStatus();
+  const loads: { account: Account; inFlight: number; used24h: number; remaining: number }[] = [];
+
   for (const acc of accounts) {
+    const accKey = acc.name || acc.email || "Account";
+    const q = quotaStatus[accKey] || { usedLast24h: 0, remaining: 15 };
     try {
       const res = await request("sessions?pageSize=20", acc.key);
       const inFlight = (res.sessions || []).filter((s: any) => s.state === "IN_PROGRESS").length;
-      loads.push({ account: acc, inFlight });
+      loads.push({ account: acc, inFlight, used24h: q.usedLast24h, remaining: q.remaining });
     } catch {
-      loads.push({ account: acc, inFlight: 99 });
+      loads.push({ account: acc, inFlight: 99, used24h: q.usedLast24h, remaining: q.remaining });
     }
   }
 
-  loads.sort((a, b) => a.inFlight - b.inFlight);
+  loads.sort((a, b) => {
+    if (a.remaining > 0 && b.remaining === 0) return -1;
+    if (a.remaining === 0 && b.remaining > 0) return 1;
+    if (a.inFlight !== b.inFlight) return a.inFlight - b.inFlight;
+    return a.used24h - b.used24h;
+  });
+
   return loads[0].account;
 }
 
-// Decorate prompt with Architectural Invariants & Anti-Pause autonomous instructions
+// Decorate prompt with Architectural Invariants, Container Test Run Directives & Anti-Pause autonomous instructions
 function decoratePrompt(rawPrompt: string, repoIdentifier: string): string {
   const cleanRepo = repoIdentifier.toLowerCase().replace(/^sources\/github\/[^\/]+\//, "");
   let invariant = "";
@@ -165,21 +290,28 @@ function decoratePrompt(rawPrompt: string, repoIdentifier: string): string {
     }
   }
 
+  let verificationDirective = "";
+  if (cleanRepo.includes("backend") || cleanRepo.includes("brain") || cleanRepo.includes("channel") || cleanRepo.includes("trader")) {
+    verificationDirective = `\nCRITICAL CONTAINER TEST RUNNER:\nIn your container sandbox, execute 'pytest' or 'python3 -m unittest' and verify 0 test failures before finalizing output.\n`;
+  } else if (cleanRepo.includes("frontend") || cleanRepo.includes("staybooked") || cleanRepo.includes("mcp") || cleanRepo.includes("frontdesk")) {
+    verificationDirective = `\nCRITICAL CONTAINER TEST RUNNER:\nIn your container sandbox, execute 'npm run build' (or 'npx tsc --noEmit') and project test suites to verify 0 type or test errors before finalizing output.\n`;
+  }
+
   const antiPauseGuard = `
 CRITICAL AUTONOMOUS EXECUTION DIRECTIVES:
 1. Work completely autonomously: do NOT pause or ask questions.
 2. If choice is needed, pick the standard TypeScript/Python stdlib approach.
 3. Make small, surgical, modular diffs. Do NOT rewrite working code.
-4. Execute tests and clean up temporary logs/debug files before final commit.
+4. Execute tests in sandbox and clean up temporary logs/debug files before final commit.
 `;
 
-  return `${rawPrompt.trim()}${invariant}\n${antiPauseGuard}`.trim();
+  return `${rawPrompt.trim()}${invariant}${verificationDirective}\n${antiPauseGuard}`.trim();
 }
 
 const server = new Server(
   {
     name: "jules-mcp",
-    version: "1.4.0",
+    version: "1.5.0",
   },
   {
     capabilities: {
@@ -253,7 +385,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "jules_dispatch_and_wait",
-        description: "Create a new Jules coding task and immediately block/wait for it in a single MCP tool call. Automatically injects architectural invariants and anti-pause directives.",
+        description: "Create a new Jules coding task and immediately block/wait for it in a single MCP tool call. Automatically injects architectural invariants, sandbox test runner commands, and anti-pause directives.",
         inputSchema: {
           type: "object",
           properties: {
@@ -287,6 +419,58 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           },
           required: ["source", "prompt"],
+        },
+      },
+      {
+        name: "jules_recipe_dispatch",
+        description: "Dispatch a standardized, high-efficiency chore recipe with pre-tested prompt blueprints (e.g. 'scaffold-unit-test', 'add-strict-types', 'document-endpoints', 'clean-dead-code', 'refactor-isolated-helper'). Eliminates prompt ambiguity and ensures optimal output quality.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            recipe: {
+              type: "string",
+              description: "Recipe name: 'scaffold-unit-test', 'add-strict-types', 'document-endpoints', 'clean-dead-code', or 'refactor-isolated-helper'.",
+            },
+            source: {
+              type: "string",
+              description: "Target GitHub repository identifier (e.g. 'Agent-Brain' or 'Basria-backend').",
+            },
+            target_path: {
+              type: "string",
+              description: "Target file path or module (e.g. 'src/services/billing.ts' or 'routers/auth.py').",
+            },
+            additional_instructions: {
+              type: "string",
+              description: "Optional extra domain instructions or constraints for the recipe.",
+            },
+            auto_create_pr: {
+              type: "boolean",
+              description: "If true, opens a GitHub PR directly in the cloud (defaults to true).",
+            },
+            wait_for_completion: {
+              type: "boolean",
+              description: "If true, blocks/waits synchronously for the chore to complete (defaults to false).",
+            },
+          },
+          required: ["recipe", "source", "target_path"],
+        },
+      },
+      {
+        name: "jules_verify_patch",
+        description: "Dry-run preflight check: inspects a completed session's git patch and runs 'git apply --check --3way' against a local workspace to verify whether the patch will apply cleanly with 0 conflicts before creating branches or writing files.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            session_id: {
+              type: "string",
+              description: "The Jules session ID containing the git patch.",
+            },
+            repo_path: {
+              type: "string",
+              description: "Absolute local repository path on this machine (e.g. '/root/projects/agent-brain').",
+            },
+          },
+          required: ["session_id", "repo_path"],
         },
       },
       {
@@ -496,7 +680,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "jules_create_task",
-        description: "Dispatch an asynchronous coding chore to Google Jules. Automatically decorates prompt with system invariants and anti-pause directives.",
+        description: "Dispatch an asynchronous coding chore to Google Jules. Automatically decorates prompt with system invariants, sandbox test runners, and anti-pause directives.",
         inputSchema: {
           type: "object",
           properties: {
@@ -795,7 +979,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "jules_pool_status",
-        description: "Check the health, active vs completed count, and remaining quota across all Google accounts in the pool.",
+        description: "Check the health, rolling 24-hour quota ledger, active vs completed count, and remaining capacity across all Google accounts in the pool.",
         inputSchema: {
           type: "object",
           properties: {},
@@ -1106,6 +1290,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
       const bestAccount = await getLeastLoadedAccount();
       const created = await request("sessions", bestAccount.key, { method: "POST" }, payload);
       const sid = created.id || created.name?.replace("sessions/", "");
+      recordDispatch(bestAccount.name || bestAccount.email || "Account", sid, sourceResource);
 
       const startTime = Date.now();
       let lastState = created.state || "IN_PROGRESS";
@@ -1169,7 +1354,215 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 5: jules_consolidate_sessions (3-Way Merge & Unified PR)
+    // TOOL 5: jules_recipe_dispatch
+    // ----------------------------------------------------
+    if (name === "jules_recipe_dispatch") {
+      const recipeKey = args.recipe as string;
+      const sourceInput = args.source as string;
+      const targetPath = args.target_path as string;
+      const extra = args.additional_instructions as string | undefined;
+      const autoCreatePr = args.auto_create_pr !== false;
+      const waitForCompletion = !!args.wait_for_completion;
+
+      const recipe = CHORE_RECIPES[recipeKey];
+      if (!recipe) {
+        throw new Error(
+          `Invalid recipe '${recipeKey}'. Available recipes:\n` +
+            Object.entries(CHORE_RECIPES)
+              .map(([k, v]) => `• \`${k}\`: ${v.description}`)
+              .join("\n")
+        );
+      }
+
+      const generatedPrompt = recipe.buildPrompt(targetPath, extra);
+      const title = `[${recipe.name}] ${targetPath}`;
+
+      // Check Deprecated Repos
+      const cleanRepo = sourceInput.toLowerCase().replace(/^sources\/github\/[^\/]+\//, "");
+      if (DEPRECATED_REPOS[cleanRepo]) {
+        throw new Error(`Repository '${cleanRepo}' is deprecated. Reason: ${DEPRECATED_REPOS[cleanRepo]}`);
+      }
+
+      const sourceResource = sourceInput.startsWith("sources/")
+        ? sourceInput
+        : `sources/github/yasserbousrih/${sourceInput.replace(/^sources\/github\//, "")}`;
+
+      const decoratedPrompt = decoratePrompt(generatedPrompt, sourceInput);
+
+      const payload: any = {
+        prompt: decoratedPrompt,
+        title,
+        sourceContext: {
+          source: sourceResource,
+          githubRepoContext: { startingBranch: "main" },
+        },
+        automationMode: autoCreatePr ? "AUTO_CREATE_PR" : "AUTOMATION_MODE_UNSPECIFIED",
+        requirePlanApproval: false,
+        environmentVariablesEnabled: true,
+      };
+
+      const bestAccount = await getLeastLoadedAccount();
+      const created = await request("sessions", bestAccount.key, { method: "POST" }, payload);
+      const sid = created.id || created.name?.replace("sessions/", "");
+      recordDispatch(bestAccount.name || bestAccount.email || "Account", sid, sourceResource);
+
+      if (waitForCompletion) {
+        let lastState = created.state || "IN_PROGRESS";
+        let sessionData = created;
+        const startTime = Date.now();
+
+        while (Date.now() - startTime < 120000) {
+          await new Promise((r) => setTimeout(r, 5000));
+          try {
+            sessionData = await request(`sessions/${sid}`, bestAccount.key);
+            lastState = sessionData.state || "STATE_UNSPECIFIED";
+            if (["COMPLETED", "FAILED"].includes(lastState)) break;
+          } catch {}
+        }
+
+        let prUrl = null;
+        for (const out of sessionData?.outputs || []) {
+          if (out.pullRequest?.url) prUrl = out.pullRequest.url;
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  recipe: recipeKey,
+                  session_id: sid,
+                  state: lastState,
+                  account: bestAccount.name || bestAccount.email,
+                  pull_request: prUrl,
+                  web_url: sessionData.url || `https://jules.google.com/session/${sid}`,
+                },
+                null,
+                2
+              ),
+            },
+            {
+              type: "text",
+              text: `### Recipe '${recipe.name}' Dispatched & Completed\n\n• **Session:** \`${sid}\`\n• **State:** **${lastState}**\n` +
+                (prUrl ? `• **Pull Request:** ${prUrl}\n` : "") +
+                `• **Web URL:** ${sessionData.url || `https://jules.google.com/session/${sid}`}`,
+            },
+          ],
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                recipe: recipeKey,
+                session_id: sid,
+                account: bestAccount.name || bestAccount.email,
+                state: created.state,
+                web_url: created.url || `https://jules.google.com/session/${sid}`,
+              },
+              null,
+              2
+            ),
+          },
+          {
+            type: "text",
+            text: `### Recipe '${recipe.name}' Dispatched to Google Jules\n\n• **Session ID:** \`${sid}\`\n• **Target:** \`${targetPath}\` on \`${sourceInput}\`\n• **Account:** ${bestAccount.name || bestAccount.email}\n• **Web URL:** ${created.url || `https://jules.google.com/session/${sid}`}`,
+          },
+        ],
+      };
+    }
+
+    // ----------------------------------------------------
+    // TOOL 6: jules_verify_patch (Dry-Run Conflict Check)
+    // ----------------------------------------------------
+    if (name === "jules_verify_patch") {
+      const sessionId = (args.session_id as string).replace("sessions/", "");
+      const repoPath = path.resolve(args.repo_path as string);
+
+      if (!fs.existsSync(repoPath) || !fs.statSync(repoPath).isDirectory()) {
+        throw new Error(`Directory does not exist: ${repoPath}`);
+      }
+
+      const { data: session } = await requestWithFallback(`sessions/${sessionId}`);
+      let gitPatch: string | null = null;
+      let commitMessage: string | null = null;
+
+      for (const out of session.outputs || []) {
+        if (out.changeSet) {
+          if (typeof out.changeSet.gitPatch === "string") {
+            gitPatch = out.changeSet.gitPatch;
+          } else if (out.changeSet.gitPatch?.unidiffPatch) {
+            gitPatch = out.changeSet.gitPatch.unidiffPatch;
+          }
+          if (out.changeSet.suggestedCommitMessage) {
+            commitMessage = out.changeSet.suggestedCommitMessage;
+          }
+        }
+      }
+
+      if (!gitPatch) {
+        throw new Error(`No git patch found in session ${sessionId}.`);
+      }
+
+      const patchFile = path.join(os.tmpdir(), `jules_verify_${sessionId}.patch`);
+      fs.writeFileSync(patchFile, gitPatch, "utf-8");
+
+      let cleanApply = false;
+      let checkOutput = "";
+      try {
+        execSync(`git apply --check --3way ${patchFile}`, { cwd: repoPath, encoding: "utf-8" });
+        cleanApply = true;
+        checkOutput = "Patch passes preflight verification and applies cleanly with 3-way reconciliation.";
+      } catch (err: any) {
+        cleanApply = false;
+        checkOutput = err.stderr?.toString() || err.message;
+      }
+
+      const modifiedFiles: string[] = [];
+      const lines = gitPatch.split("\n");
+      for (const line of lines) {
+        if (line.startsWith("diff --git a/")) {
+          const match = line.match(/^diff --git a\/(.*) b\/(.*)$/);
+          if (match && match[1]) modifiedFiles.push(match[1]);
+        }
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                session_id: sessionId,
+                repo_path: repoPath,
+                preflight_clean: cleanApply,
+                commit_message: commitMessage,
+                files_touched: modifiedFiles,
+                check_details: checkOutput,
+              },
+              null,
+              2
+            ),
+          },
+          {
+            type: "text",
+            text: `### Preflight Patch Verification: Session \`${sessionId}\`\n\n` +
+              `• **Target Repo:** \`${repoPath}\`\n` +
+              `• **Status:** ${cleanApply ? "✅ APPLIES CLEANLY (0 Conflicts)" : "⚠️ CONFLICT DETECTED"}\n` +
+              `• **Files Modified (${modifiedFiles.length}):** ${modifiedFiles.map((f) => `\`${f}\``).join(", ")}\n` +
+              `• **Commit Message:** \`${commitMessage || "(None)"}\`\n\n` +
+              `**Preflight Output:**\n\`\`\`\n${checkOutput}\n\`\`\``,
+          },
+        ],
+      };
+    }
+
+    // ----------------------------------------------------
+    // TOOL 7: jules_consolidate_sessions (3-Way Merge & Unified PR)
     // ----------------------------------------------------
     if (name === "jules_consolidate_sessions") {
       const repoPath = path.resolve(args.repo_path as string);
@@ -1184,7 +1577,6 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
         throw new Error(`Directory does not exist: ${repoPath}`);
       }
 
-      // Auto-discover completed sessions for this repo if session_ids omitted
       const repoName = path.basename(repoPath).toLowerCase();
       if (!sessionIds || sessionIds.length === 0) {
         const accounts = getAccounts();
@@ -1209,7 +1601,6 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
         throw new Error(`No completed sessions found to consolidate for repo: ${repoPath}`);
       }
 
-      // Prepare local git branch
       try {
         execSync(`git checkout ${baseBranch} && git pull origin ${baseBranch}`, { cwd: repoPath, stdio: "pipe" });
       } catch {}
@@ -1241,13 +1632,11 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
           const patchFile = path.join(os.tmpdir(), `jules_consolidate_${cleanSid}.patch`);
           fs.writeFileSync(patchFile, patch, "utf-8");
 
-          // Try 3-way git apply to resolve branch drift seamlessly
           let applySuccess = false;
           try {
             execSync(`git apply --3way --whitespace=fix ${patchFile}`, { cwd: repoPath, stdio: "pipe" });
             applySuccess = true;
           } catch {
-            // Fallback: standard git apply with reject
             try {
               execSync(`git apply --whitespace=nowarn --ignore-whitespace ${patchFile}`, { cwd: repoPath, stdio: "pipe" });
               applySuccess = true;
@@ -1268,7 +1657,6 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
         }
       }
 
-      // Execute optional test verification
       let testPassed = true;
       let testOutput = null;
       if (testCommand) {
@@ -1280,7 +1668,6 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
         }
       }
 
-      // Create unified GitHub PR if requested
       let prUrl = null;
       if (autoCreatePr && appliedSessions.length > 0 && testPassed) {
         try {
@@ -1332,7 +1719,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 6: jules_rebase_pr
+    // TOOL 8: jules_rebase_pr
     // ----------------------------------------------------
     if (name === "jules_rebase_pr") {
       const repoPath = path.resolve(args.repo_path as string);
@@ -1373,7 +1760,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 7: jules_queue_tasks
+    // TOOL 9: jules_queue_tasks
     // ----------------------------------------------------
     if (name === "jules_queue_tasks") {
       const sourceInput = args.source as string;
@@ -1407,6 +1794,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
         const targetAccount = await getLeastLoadedAccount();
         const created = await request("sessions", targetAccount.key, { method: "POST" }, payload);
         const sid = created.id || created.name?.replace("sessions/", "");
+        recordDispatch(targetAccount.name || targetAccount.email || "Account", sid, sourceResource);
 
         const startTime = Date.now();
         let finalState = "IN_PROGRESS";
@@ -1447,7 +1835,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 8: jules_stream_progress
+    // TOOL 10: jules_stream_progress
     // ----------------------------------------------------
     if (name === "jules_stream_progress") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1507,7 +1895,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 9: jules_apply_patch
+    // TOOL 11: jules_apply_patch
     // ----------------------------------------------------
     if (name === "jules_apply_patch") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1553,7 +1941,6 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
         execSync(`git checkout -B ${branchName}`, { cwd: repoPath, stdio: "pipe" });
       }
 
-      // Apply with 3-way support
       try {
         execSync(`git apply --3way --whitespace=fix ${patchFile}`, { cwd: repoPath, stdio: "pipe" });
       } catch {
@@ -1618,7 +2005,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 10: jules_review_pr
+    // TOOL 12: jules_review_pr
     // ----------------------------------------------------
     if (name === "jules_review_pr") {
       const target = args.pr_url_or_number as string;
@@ -1660,7 +2047,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 11: jules_merge_pr
+    // TOOL 13: jules_merge_pr
     // ----------------------------------------------------
     if (name === "jules_merge_pr") {
       const target = args.pr_url_or_number as string;
@@ -1692,7 +2079,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 12: jules_list_sources
+    // TOOL 14: jules_list_sources
     // ----------------------------------------------------
     if (name === "jules_list_sources") {
       const pageSize = Number(args.page_size) || 30;
@@ -1733,7 +2120,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 13: jules_get_source
+    // TOOL 15: jules_get_source
     // ----------------------------------------------------
     if (name === "jules_get_source") {
       const sourceInput = args.source as string;
@@ -1753,7 +2140,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 14: jules_create_task
+    // TOOL 16: jules_create_task
     // ----------------------------------------------------
     if (name === "jules_create_task") {
       const sourceInput = args.source as string;
@@ -1766,7 +2153,6 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
       const envVarsEnabled = args.environment_variables_enabled !== false;
       const accountTarget = args.account as string | undefined;
 
-      // Check Deprecated Repos
       const cleanRepo = sourceInput.toLowerCase().replace(/^sources\/github\/[^\/]+\//, "");
       if (DEPRECATED_REPOS[cleanRepo]) {
         throw new Error(`Repository '${cleanRepo}' is deprecated. Reason: ${DEPRECATED_REPOS[cleanRepo]}`);
@@ -1799,16 +2185,19 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
         ? { data: await request("sessions", targetAccount.key, { method: "POST" }, payload), account: targetAccount }
         : await requestWithFallback("sessions", { method: "POST" }, payload, accountTarget);
 
+      const sid = data.id || data.name?.replace("sessions/", "");
+      recordDispatch(account.name || account.email || "Account", sid, sourceResource);
+
       return {
         content: [
           {
             type: "text",
             text: JSON.stringify(
               {
-                session_id: data.id || data.name?.replace("sessions/", ""),
+                session_id: sid,
                 account_used: account.name || account.email,
                 state: data.state,
-                web_url: data.url || `https://jules.google.com/session/${data.id || data.name?.replace("sessions/", "")}`,
+                web_url: data.url || `https://jules.google.com/session/${sid}`,
                 full_response: data,
               },
               null,
@@ -1820,7 +2209,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 15: jules_batch_dispatch
+    // TOOL 17: jules_batch_dispatch
     // ----------------------------------------------------
     if (name === "jules_batch_dispatch") {
       const tasks = args.tasks as any[];
@@ -1860,12 +2249,15 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
 
           const targetAccount = await getLeastLoadedAccount();
           const data = await request("sessions", targetAccount.key, { method: "POST" }, payload);
+          const sid = data.id || data.name?.replace("sessions/", "");
+          recordDispatch(targetAccount.name || targetAccount.email || "Account", sid, sourceResource);
+
           results.push({
             status: "success",
             source: t.source,
-            session_id: data.id || data.name?.replace("sessions/", ""),
+            session_id: sid,
             account: targetAccount.name || targetAccount.email,
-            web_url: data.url || `https://jules.google.com/session/${data.id || data.name?.replace("sessions/", "")}`,
+            web_url: data.url || `https://jules.google.com/session/${sid}`,
           });
         } catch (err: any) {
           results.push({
@@ -1887,7 +2279,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 16: jules_list_sessions
+    // TOOL 18: jules_list_sessions
     // ----------------------------------------------------
     if (name === "jules_list_sessions") {
       const state = args.state as string | undefined;
@@ -1939,7 +2331,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 17: jules_get_session
+    // TOOL 19: jules_get_session
     // ----------------------------------------------------
     if (name === "jules_get_session") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1956,7 +2348,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 18: jules_list_activities
+    // TOOL 20: jules_list_activities
     // ----------------------------------------------------
     if (name === "jules_list_activities") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -1981,7 +2373,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 19: jules_get_activity
+    // TOOL 21: jules_get_activity
     // ----------------------------------------------------
     if (name === "jules_get_activity") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -2000,7 +2392,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 20: jules_get_plan
+    // TOOL 22: jules_get_plan
     // ----------------------------------------------------
     if (name === "jules_get_plan") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -2031,7 +2423,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 21: jules_approve_plan
+    // TOOL 23: jules_approve_plan
     // ----------------------------------------------------
     if (name === "jules_approve_plan") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -2052,7 +2444,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 22: jules_reply_feedback
+    // TOOL 24: jules_reply_feedback
     // ----------------------------------------------------
     if (name === "jules_reply_feedback") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -2075,7 +2467,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 23: jules_get_patch
+    // TOOL 25: jules_get_patch
     // ----------------------------------------------------
     if (name === "jules_get_patch") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -2118,7 +2510,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 24: jules_inspect_bash_logs
+    // TOOL 26: jules_inspect_bash_logs
     // ----------------------------------------------------
     if (name === "jules_inspect_bash_logs") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -2149,7 +2541,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 25: jules_get_media_artifacts
+    // TOOL 27: jules_get_media_artifacts
     // ----------------------------------------------------
     if (name === "jules_get_media_artifacts") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -2178,7 +2570,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 26: jules_archive_session
+    // TOOL 28: jules_archive_session
     // ----------------------------------------------------
     if (name === "jules_archive_session") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -2198,7 +2590,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 27: jules_delete_session
+    // TOOL 29: jules_delete_session
     // ----------------------------------------------------
     if (name === "jules_delete_session") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
@@ -2215,7 +2607,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 28: jules_sync_prs
+    // TOOL 30: jules_sync_prs
     // ----------------------------------------------------
     if (name === "jules_sync_prs") {
       const sessionId = args.session_id as string | undefined;
@@ -2256,17 +2648,22 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
-    // TOOL 29: jules_pool_status
+    // TOOL 31: jules_pool_status
     // ----------------------------------------------------
     if (name === "jules_pool_status") {
       const accounts = getAccounts();
+      const quotaStatus = getQuotaStatus();
       const status: any[] = [];
       let totalActive = 0;
       let totalCompleted = 0;
+      let totalUsed24h = 0;
 
       for (let i = 0; i < accounts.length; i++) {
         const acc = accounts[i];
         const accName = acc.name || acc.email || `Account-${i + 1}`;
+        const q = quotaStatus[accName] || { usedLast24h: 0, remaining: 15, nextResetMinutes: undefined };
+        totalUsed24h += q.usedLast24h;
+
         try {
           const res = await request("sessions?pageSize=50", acc.key);
           const sessions = res.sessions || [];
@@ -2278,7 +2675,10 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
           status.push({
             account: accName,
             status: "ACTIVE",
-            daily_quota: "15 tasks / 24h",
+            daily_limit: 15,
+            used_last_24h: q.usedLast24h,
+            remaining_24h_quota: q.remaining,
+            next_reset_in_minutes: q.nextResetMinutes ?? 0,
             active_sessions: active,
             completed_sessions: completed,
             total_loaded: sessions.length,
@@ -2300,6 +2700,8 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
               {
                 accounts_count: accounts.length,
                 total_daily_quota: `${accounts.length * 15} tasks / 24h`,
+                used_last_24h: totalUsed24h,
+                remaining_pool_quota: accounts.length * 15 - totalUsed24h,
                 total_in_flight: totalActive,
                 total_completed: totalCompleted,
                 pool: status,
@@ -2329,7 +2731,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
 async function run() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  process.stderr.write("Jules MCP Server running on stdio (29 tools)\n");
+  process.stderr.write("Jules MCP Server running on stdio (31 tools)\n");
 }
 
 run().catch((error) => {

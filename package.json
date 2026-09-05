@@ -1,6 +1,6 @@
 {
   "name": "jules-mcp",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Universal MCP (Model Context Protocol) Server & CLI for Google Jules Cloud Agent - multi-account rotation, session management, 3-way consolidation, and automated PR integration",
   "type": "module",
   "main": "dist/index.js",
