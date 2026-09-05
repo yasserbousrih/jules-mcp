@@ -40,7 +40,7 @@ class TestMcpClient {
     await this.send("initialize", {
       protocolVersion: "2024-11-05",
       capabilities: {},
-      clientInfo: { name: "jules-test-suite", version: "1.0.0" },
+      clientInfo: { name: "jules-test-suite", version: "1.5.0" },
     });
     this.proc.stdin?.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
   }
@@ -63,19 +63,21 @@ class TestMcpClient {
   }
 }
 
-describe("Jules MCP Server & Tool Registry", () => {
+describe("Jules MCP Server & Tool Registry v1.5.0", () => {
   let client: TestMcpClient;
 
-  it("should initialize MCP server and register 29 tools", async () => {
+  it("should initialize MCP server and register 31 tools", async () => {
     client = new TestMcpClient();
     await client.init();
 
     const listRes = await client.send("tools/list");
     assert.ok(listRes.tools, "tools array must exist");
-    assert.equal(listRes.tools.length, 29, "Must register exactly 29 native tools");
+    assert.equal(listRes.tools.length, 31, "Must register exactly 31 native tools");
 
     const toolNames = listRes.tools.map((t: any) => t.name);
     assert.ok(toolNames.includes("jules_pool_status"));
+    assert.ok(toolNames.includes("jules_recipe_dispatch"));
+    assert.ok(toolNames.includes("jules_verify_patch"));
     assert.ok(toolNames.includes("jules_consolidate_sessions"));
     assert.ok(toolNames.includes("jules_rebase_pr"));
     assert.ok(toolNames.includes("jules_apply_patch"));
@@ -83,12 +85,14 @@ describe("Jules MCP Server & Tool Registry", () => {
     assert.ok(toolNames.includes("jules_check_events"));
   });
 
-  it("should query live pool status across all 3 accounts", async () => {
+  it("should query live pool status with 24h rolling quota calculation", async () => {
     const res = await client.callTool("jules_pool_status");
     assert.ok(res.content && res.content.length > 0);
     const parsed = JSON.parse(res.content[0].text);
     assert.equal(parsed.accounts_count, 3);
     assert.equal(parsed.total_daily_quota, "45 tasks / 24h");
+    assert.ok(typeof parsed.used_last_24h === "number");
+    assert.ok(typeof parsed.remaining_pool_quota === "number");
     assert.ok(Array.isArray(parsed.pool));
     assert.equal(parsed.pool.length, 3);
   });
@@ -109,6 +113,20 @@ describe("Jules MCP Server & Tool Registry", () => {
     assert.ok(parsed.source);
     assert.equal(parsed.source.githubRepo?.repo, "Agent-Brain");
     assert.ok(parsed.source.githubRepo?.branches?.length > 0);
+  });
+
+  it("should perform dry-run preflight check on real completed patch via jules_verify_patch", async () => {
+    const res = await client.callTool("jules_verify_patch", {
+      session_id: "13091084449805634763",
+      repo_path: "/root/projects/agent-brain",
+    });
+    assert.ok(res.content && res.content.length >= 2);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.session_id, "13091084449805634763");
+    assert.equal(parsed.repo_path, "/root/projects/agent-brain");
+    assert.ok(typeof parsed.preflight_clean === "boolean");
+    assert.ok(Array.isArray(parsed.files_touched));
+    assert.ok(parsed.files_touched.includes("tests/test_health.py"));
   });
 
   it("should extract patch details from a verified completed session", async () => {
