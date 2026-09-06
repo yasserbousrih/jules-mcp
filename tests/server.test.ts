@@ -72,10 +72,13 @@ describe("Jules MCP Server & Tool Registry v1.6.0", () => {
 
     const listRes = await client.send("tools/list");
     assert.ok(listRes.tools, "tools array must exist");
-    assert.equal(listRes.tools.length, 34, "Must register exactly 34 native tools");
+    assert.equal(listRes.tools.length, 37, "Must register exactly 37 native tools");
 
     const toolNames = listRes.tools.map((t: any) => t.name);
     assert.ok(toolNames.includes("jules_pool_status"));
+    assert.ok(toolNames.includes("jules_set_repo_env"));
+    assert.ok(toolNames.includes("jules_get_repo_env"));
+    assert.ok(toolNames.includes("jules_delete_repo_env"));
     assert.ok(toolNames.includes("jules_recipe_dispatch"));
     assert.ok(toolNames.includes("jules_verify_patch"));
     assert.ok(toolNames.includes("jules_consolidate_sessions"));
@@ -86,6 +89,43 @@ describe("Jules MCP Server & Tool Registry v1.6.0", () => {
     assert.ok(toolNames.includes("jules_queue_status"));
     assert.ok(toolNames.includes("jules_drain_queue"));
     assert.ok(toolNames.includes("jules_inspect_locks"));
+  });
+
+  it("should manage repo env vault via jules_set_repo_env and jules_get_repo_env", async () => {
+    // 1. Set environment variables
+    const setRes = await client.callTool("jules_set_repo_env", {
+      repo: "test-vault-repo",
+      env_vars: {
+        DATABASE_URL: "postgresql://test:secret@localhost:5432/db",
+        API_KEY: "secret_12345",
+      },
+    });
+    assert.ok(setRes.content && setRes.content.length > 0);
+    const setParsed = JSON.parse(setRes.content[0].text);
+    assert.equal(setParsed.status, "success");
+    assert.equal(setParsed.repo, "test-vault-repo");
+    assert.equal(setParsed.total_keys, 2);
+
+    // 2. Get environment variables with masking
+    const getRes = await client.callTool("jules_get_repo_env", {
+      repo: "test-vault-repo",
+      show_secrets: false,
+    });
+    const getParsed = JSON.parse(getRes.content[0].text);
+    assert.equal(getParsed.configured, true);
+    assert.ok(getParsed.env.API_KEY.includes("****"));
+
+    // 3. Delete specific key
+    const delRes = await client.callTool("jules_delete_repo_env", {
+      repo: "test-vault-repo",
+      keys: ["API_KEY"],
+    });
+    const delParsed = JSON.parse(delRes.content[0].text);
+    assert.equal(delParsed.status, "success");
+    assert.deepEqual(delParsed.remaining_keys, ["DATABASE_URL"]);
+
+    // 4. Delete all
+    await client.callTool("jules_delete_repo_env", { repo: "test-vault-repo" });
   });
 
   it("should query live pool status with 24h rolling quota calculation", async () => {
