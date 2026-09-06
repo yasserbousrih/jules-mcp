@@ -1390,7 +1390,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
             if (s.state === "AWAITING_USER_FEEDBACK") {
               const sid = s.id || s.name?.replace("sessions/", "");
               try {
-                await request(`sessions/${sid}:sendMessage`, acc.key, { method: "POST" }, { message: customInstruction });
+                await request(`sessions/${sid}:sendMessage`, acc.key, { method: "POST" }, { prompt: customInstruction });
                 nudgedSessions.push({
                   session_id: sid,
                   repo: s.sourceContext?.source,
@@ -1452,7 +1452,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
                 `sessions/${sessionId}:sendMessage`,
                 targetAccount.key,
                 { method: "POST" },
-                { message: "Proceed autonomously with minimal surgical diffs according to project conventions." }
+                { prompt: "Proceed autonomously with minimal surgical diffs according to project conventions." }
               );
               lastState = "IN_PROGRESS (Auto-unblocked question)";
             } catch {}
@@ -1562,7 +1562,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
                 `sessions/${sid}:sendMessage`,
                 bestAccount.key,
                 { method: "POST" },
-                { message: "Proceed autonomously with minimal surgical diffs according to project conventions." }
+                { prompt: "Proceed autonomously with minimal surgical diffs according to project conventions." }
               );
               lastState = "IN_PROGRESS (Auto-unblocked)";
             } catch {}
@@ -2738,7 +2738,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
       const { data, account } = await requestWithFallback(
         `sessions/${sessionId}:sendMessage`,
         { method: "POST" },
-        { message }
+        { prompt: message }
       );
 
       return {
