@@ -16,6 +16,8 @@ const CONFIG_PATH = process.env.JULES_CONFIG_PATH || path.join(process.env.HOME 
 const USAGE_PATH = process.env.JULES_USAGE_PATH || path.join(process.env.HOME || "/root", ".config/jules/usage.json");
 const QUEUE_PATH = process.env.JULES_QUEUE_PATH || path.join(process.env.HOME || "/root", ".config/jules/queue.json");
 const LOCKS_PATH = process.env.JULES_LOCKS_PATH || path.join(process.env.HOME || "/root", ".config/jules/locks.json");
+const REPO_ENVS_PATH = process.env.JULES_REPO_ENVS_PATH || path.join(process.env.HOME || "/root", ".config/jules/repo_envs.json");
+const ORIGINS_PATH = process.env.JULES_ORIGINS_PATH || path.join(process.env.HOME || "/root", ".config/jules/origins.json");
 const API_BASE = "https://jules.googleapis.com/v1alpha";
 
 interface Account {
@@ -34,10 +36,22 @@ interface DispatchRecord {
   timestamp: number;
   sessionId: string;
   repo: string;
+  profile?: string;
 }
 
 interface UsageLedger {
   dispatches: DispatchRecord[];
+}
+
+interface SessionOrigin {
+  profile: string;
+  source: string;
+  account?: string;
+  createdAt: number;
+}
+
+interface OriginsLedger {
+  sessions: Record<string, SessionOrigin>;
 }
 interface QueuedTask {
   id: string;
@@ -65,6 +79,87 @@ interface FileLock {
 
 interface LocksLedger {
   locks: FileLock[];
+}
+
+interface RepoEnvsMap {
+  [repo: string]: Record<string, string>;
+}
+
+function loadRepoEnvs(): RepoEnvsMap {
+  if (fs.existsSync(REPO_ENVS_PATH)) {
+    try {
+      return JSON.parse(fs.readFileSync(REPO_ENVS_PATH, "utf-8"));
+    } catch {}
+  }
+  return {};
+}
+
+function saveRepoEnvs(envs: RepoEnvsMap) {
+  try {
+    const dir = path.dirname(REPO_ENVS_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(REPO_ENVS_PATH, JSON.stringify(envs, null, 2), "utf-8");
+  } catch {}
+}
+
+function getRepoEnv(repoIdentifier: string): Record<string, string> | undefined {
+  const envs = loadRepoEnvs();
+  const cleanRepo = repoIdentifier.toLowerCase().replace(/^sources\/github\/[^/]+\//, "").split("/").pop() || "";
+  for (const [key, val] of Object.entries(envs)) {
+    const cleanKey = key.toLowerCase().replace(/^sources\/github\/[^/]+\//, "").split("/").pop() || "";
+    if (cleanKey === cleanRepo || cleanRepo.includes(cleanKey) || cleanKey.includes(cleanRepo)) {
+      return val;
+    }
+  }
+  return undefined;
+}
+
+function detectActiveProfile(): string {
+  const hermesHome = process.env.HERMES_HOME || "";
+  if (hermesHome.includes("/profiles/")) {
+    return hermesHome.split("/profiles/")[1].split("/")[0];
+  }
+  if (process.env.HERMES_SESSION_PROFILE) {
+    return process.env.HERMES_SESSION_PROFILE;
+  }
+  return "default";
+}
+
+function loadOrigins(): OriginsLedger {
+  if (fs.existsSync(ORIGINS_PATH)) {
+    try {
+      return JSON.parse(fs.readFileSync(ORIGINS_PATH, "utf-8"));
+    } catch {}
+  }
+  return { sessions: {} };
+}
+
+function saveOrigins(ledger: OriginsLedger) {
+  try {
+    const dir = path.dirname(ORIGINS_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(ORIGINS_PATH, JSON.stringify(ledger, null, 2), "utf-8");
+  } catch {}
+}
+
+function recordSessionOrigin(sessionId: string, source: string, profileOverride?: string, account?: string) {
+  const profile = profileOverride || detectActiveProfile();
+  const ledger = loadOrigins();
+  if (!ledger.sessions) ledger.sessions = {};
+  const cleanSid = sessionId.replace(/^sessions\//, "");
+  ledger.sessions[cleanSid] = {
+    profile,
+    source,
+    account,
+    createdAt: Math.floor(Date.now() / 1000),
+  };
+  saveOrigins(ledger);
+}
+
+function getSessionOrigin(sessionId: string): SessionOrigin | null {
+  const ledger = loadOrigins();
+  const cleanSid = sessionId.replace(/^sessions\//, "");
+  return ledger.sessions?.[cleanSid] || null;
 }
 
 function loadTaskQueue(): TaskQueue {
@@ -321,15 +416,18 @@ function saveUsageLedger(ledger: UsageLedger) {
   } catch {}
 }
 
-function recordDispatch(account: string, sessionId: string, repo: string) {
+function recordDispatch(account: string, sessionId: string, repo: string, profileOverride?: string) {
+  const profile = profileOverride || detectActiveProfile();
   const ledger = loadUsageLedger();
   ledger.dispatches.push({
     account,
     timestamp: Date.now(),
     sessionId,
     repo,
+    profile,
   });
   saveUsageLedger(ledger);
+  recordSessionOrigin(sessionId, repo, profile, account);
 }
 
 function getQuotaStatus() {
@@ -496,15 +594,34 @@ async function getLeastLoadedAccount(): Promise<Account> {
   return loads[0].account;
 }
 
-// Decorate prompt with Architectural Invariants, Container Test Run Directives & Anti-Pause autonomous instructions
-function decoratePrompt(rawPrompt: string, repoIdentifier: string): string {
-  const cleanRepo = repoIdentifier.toLowerCase().replace(/^sources\/github\/[^\/]+\//, "");
+// Decorate prompt with Architectural Invariants, Sandboxed Environment Variables, Container Test Run Directives & Anti-Pause autonomous instructions
+function decoratePrompt(rawPrompt: string, repoIdentifier: string, customEnv?: Record<string, string>): string {
+  const cleanRepo = repoIdentifier.toLowerCase().replace(/^sources\/github\/[^/]+\//, "");
   let invariant = "";
   for (const [key, val] of Object.entries(ARCHITECTURE_INVARIANTS)) {
     if (cleanRepo.includes(key)) {
       invariant = `\n${val}\n`;
       break;
     }
+  }
+
+  const storedEnv = getRepoEnv(repoIdentifier) || {};
+  const mergedEnv = { ...storedEnv, ...(customEnv || {}) };
+
+  let envDirective = "";
+  if (Object.keys(mergedEnv).length > 0) {
+    const envLines = Object.entries(mergedEnv)
+      .map(([k, v]) => `${k}="${String(v).replace(/"/g, '\\"')}"`)
+      .join("\n");
+    envDirective = `\nSANDBOX ENVIRONMENT INITIALIZATION:
+Before running tests or verifying builds in the container sandbox, initialize the local test environment variables:
+cat << 'EOF' > .env
+${envLines}
+EOF
+export $(grep -v '^#' .env | xargs -d '\\n') 2>/dev/null || true
+
+CRITICAL GIT HYGIENE DIRECTIVE:
+Never commit or stage the .env file or credentials into git commits, patches, or PR diffs.\n`;
   }
 
   let verificationDirective = "";
@@ -522,7 +639,7 @@ CRITICAL AUTONOMOUS EXECUTION DIRECTIVES:
 4. Execute tests in sandbox and clean up temporary logs/debug files before final commit.
 `;
 
-  return `${rawPrompt.trim()}${invariant}${verificationDirective}\n${antiPauseGuard}`.trim();
+  return `${rawPrompt.trim()}${invariant}${envDirective}${verificationDirective}\n${antiPauseGuard}`.trim();
 }
 
 const server = new Server(
@@ -1234,6 +1351,64 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {},
+        },
+      },
+      {
+        name: "jules_set_repo_env",
+        description: "Store or update environment variables / secrets for a repository in the Jules vault (~/.config/jules/repo_envs.json). These are automatically injected into the container sandbox at task creation.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            repo: {
+              type: "string",
+              description: "Repository identifier or name (e.g. 'Agent-Brain', 'staybooked', 'Basria-backend').",
+            },
+            env_vars: {
+              type: "object",
+              description: "Key-value map of environment variables (e.g. { DATABASE_URL: '...', API_KEY: '...' }).",
+            },
+            merge: {
+              type: "boolean",
+              description: "If true (default), merges with existing keys for this repo; if false, overwrites all keys for this repo.",
+            },
+          },
+          required: ["repo", "env_vars"],
+        },
+      },
+      {
+        name: "jules_get_repo_env",
+        description: "Retrieve environment variables configured for a repository in the Jules vault (~/.config/jules/repo_envs.json) with secrets optionally masked.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            repo: {
+              type: "string",
+              description: "Optional repository identifier. If omitted, returns all configured repositories.",
+            },
+            show_secrets: {
+              type: "boolean",
+              description: "If true, displays unmasked secret values. Defaults to false (masked).",
+            },
+          },
+        },
+      },
+      {
+        name: "jules_delete_repo_env",
+        description: "Delete repository environment variables or specific keys from the Jules vault (~/.config/jules/repo_envs.json).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            repo: {
+              type: "string",
+              description: "Repository identifier (e.g. 'Agent-Brain').",
+            },
+            keys: {
+              type: "array",
+              items: { type: "string" },
+              description: "Optional list of specific environment variable keys to remove. If omitted, deletes all env variables for the repo.",
+            },
+          },
+          required: ["repo"],
         },
       },
     ],
@@ -2570,9 +2745,11 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
       const state = args.state as string | undefined;
       const source = args.source as string | undefined;
       const filter = args.filter as string | undefined;
+      const profileFilter = args.profile as string | undefined;
       const pageSize = Number(args.page_size) || 30;
       const pageToken = args.page_token as string | undefined;
       const accounts = getAccounts();
+      const origins = loadOrigins();
 
       let allSessions: any[] = [];
       const seenSessions = new Set<string>();
@@ -2589,6 +2766,12 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
             if (!seenSessions.has(sid)) {
               seenSessions.add(sid);
 
+              const origin = origins.sessions?.[sid];
+              const sessionProfile = origin?.profile || "unknown";
+
+              if (profileFilter && profileFilter.toLowerCase() !== "all" && sessionProfile.toLowerCase() !== profileFilter.toLowerCase()) {
+                continue;
+              }
               if (state && s.state && s.state.toLowerCase() !== state.toLowerCase()) {
                 continue;
               }
@@ -2599,6 +2782,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
               allSessions.push({
                 ...s,
                 _account: acc.name || acc.email,
+                _origin_profile: sessionProfile,
               });
             }
           }
@@ -3145,6 +3329,156 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
               null,
               2
             ),
+          },
+        ],
+      };
+    }
+
+    // ----------------------------------------------------
+    // TOOL 32: jules_set_repo_env
+    // ----------------------------------------------------
+    if (name === "jules_set_repo_env") {
+      const repo = args.repo as string;
+      const envVars = (args.env_vars as Record<string, string>) || {};
+      const merge = args.merge !== false;
+
+      if (!repo) throw new Error("Missing required argument: 'repo'");
+      if (!envVars || typeof envVars !== "object") throw new Error("Missing or invalid 'env_vars' object");
+
+      const envs = loadRepoEnvs();
+      const existing = (merge && envs[repo]) ? envs[repo] : {};
+      envs[repo] = { ...existing, ...envVars };
+      saveRepoEnvs(envs);
+
+      const keys = Object.keys(envs[repo]);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              status: "success",
+              repo,
+              configured_keys: keys,
+              total_keys: keys.length,
+              vault_path: REPO_ENVS_PATH,
+            }, null, 2),
+          },
+          {
+            type: "text",
+            text: `### Jules Repo Vault Updated\n\n• **Repository:** \`${repo}\`\n• **Total Keys Configured:** ${keys.length}\n• **Keys:** ${keys.map(k => `\`${k}\``).join(", ")}\n\n_These credentials will be injected into all future sandbox sessions for **${repo}**._`,
+          },
+        ],
+      };
+    }
+
+    // ----------------------------------------------------
+    // TOOL 33: jules_get_repo_env
+    // ----------------------------------------------------
+    if (name === "jules_get_repo_env") {
+      const repo = args.repo as string | undefined;
+      const showSecrets = !!args.show_secrets;
+      const allEnvs = loadRepoEnvs();
+
+      const mask = (val: string) => {
+        if (!val || val.length <= 4) return "****";
+        return val.slice(0, 2) + "****" + val.slice(-2);
+      };
+
+      if (repo) {
+        const env = getRepoEnv(repo);
+        if (!env) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({ repo, configured: false, env: {} }, null, 2),
+              },
+            ],
+          };
+        }
+        const formatted: Record<string, string> = {};
+        for (const [k, v] of Object.entries(env)) {
+          formatted[k] = showSecrets ? v : mask(v);
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ repo, configured: true, total_keys: Object.keys(env).length, env: formatted }, null, 2),
+            },
+          ],
+        };
+      }
+
+      const summary: Record<string, any> = {};
+      for (const [r, env] of Object.entries(allEnvs)) {
+        const formatted: Record<string, string> = {};
+        for (const [k, v] of Object.entries(env)) {
+          formatted[k] = showSecrets ? v : mask(v);
+        }
+        summary[r] = {
+          total_keys: Object.keys(env).length,
+          keys: Object.keys(env),
+          env: formatted,
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ total_repositories: Object.keys(allEnvs).length, repositories: summary, vault_path: REPO_ENVS_PATH }, null, 2),
+          },
+        ],
+      };
+    }
+
+    // ----------------------------------------------------
+    // TOOL 34: jules_delete_repo_env
+    // ----------------------------------------------------
+    if (name === "jules_delete_repo_env") {
+      const repo = args.repo as string;
+      const keysToDelete = args.keys as string[] | undefined;
+
+      if (!repo) throw new Error("Missing required argument: 'repo'");
+      const envs = loadRepoEnvs();
+
+      if (!envs[repo]) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ status: "not_found", message: `No credentials configured for '${repo}'` }, null, 2),
+            },
+          ],
+        };
+      }
+
+      if (keysToDelete && Array.isArray(keysToDelete) && keysToDelete.length > 0) {
+        for (const k of keysToDelete) {
+          delete envs[repo][k];
+        }
+        if (Object.keys(envs[repo]).length === 0) {
+          delete envs[repo];
+        }
+        saveRepoEnvs(envs);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ status: "success", repo, deleted_keys: keysToDelete, remaining_keys: Object.keys(envs[repo] || {}) }, null, 2),
+            },
+          ],
+        };
+      }
+
+      delete envs[repo];
+      saveRepoEnvs(envs);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ status: "success", repo, message: `All environment variables deleted for '${repo}'` }, null, 2),
           },
         ],
       };
