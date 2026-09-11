@@ -1784,26 +1784,29 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
       const accounts = getAccounts();
       const nudgedSessions: any[] = [];
 
-      for (const acc of accounts) {
-        try {
-          const res = await request("sessions?pageSize=50", acc.key);
-          for (const s of res.sessions || []) {
-            if (s.state === "AWAITING_USER_FEEDBACK") {
-              const sid = s.id || s.name?.replace("sessions/", "");
-              try {
-                await request(`sessions/${sid}:sendMessage`, acc.key, { method: "POST" }, { prompt: customInstruction });
-                nudgedSessions.push({
-                  session_id: sid,
-                  repo: s.sourceContext?.source,
-                  title: s.title,
-                  account: acc.name || acc.email,
-                  status: "Nudged & Unblocked",
-                });
-              } catch {}
-            }
-          }
-        } catch {}
-      }
+      await Promise.all(
+        accounts.map(async (acc) => {
+          try {
+            const res = await request("sessions?pageSize=50", acc.key);
+            const stuckSessions = (res.sessions || []).filter((s: any) => s.state === "AWAITING_USER_FEEDBACK");
+            await Promise.all(
+              stuckSessions.map(async (s: any) => {
+                const sid = s.id || s.name?.replace("sessions/", "");
+                try {
+                  await request(`sessions/${sid}:sendMessage`, acc.key, { method: "POST" }, { prompt: customInstruction });
+                  nudgedSessions.push({
+                    session_id: sid,
+                    repo: s.sourceContext?.source,
+                    title: s.title,
+                    account: acc.name || acc.email,
+                    status: "Nudged & Unblocked",
+                  });
+                } catch {}
+              })
+            );
+          } catch {}
+        })
+      );
 
       return {
         content: [
@@ -2442,19 +2445,23 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
       if (!sessionIds || sessionIds.length === 0) {
         const accounts = getAccounts();
         sessionIds = [];
-        for (const acc of accounts) {
-          try {
-            const res = await request("sessions?pageSize=50", acc.key);
-            for (const s of res.sessions || []) {
-              if (s.state === "COMPLETED") {
-                const src = (s.sourceContext?.source || "").toLowerCase();
-                if (src.includes(repoName)) {
-                  const sid = s.id || s.name?.replace("sessions/", "");
-                  if (!sessionIds.includes(sid)) sessionIds.push(sid);
-                }
-              }
+        const sessionResults = await Promise.all(
+          accounts.map(async (acc) => {
+            try {
+              const res = await request("sessions?pageSize=50", acc.key);
+              return (res.sessions || [])
+                .filter((s: any) => s.state === "COMPLETED")
+                .filter((s: any) => (s.sourceContext?.source || "").toLowerCase().includes(repoName))
+                .map((s: any) => s.id || s.name?.replace("sessions/", ""));
+            } catch {
+              return [];
             }
-          } catch {}
+          })
+        );
+        for (const sids of sessionResults) {
+          for (const sid of sids) {
+            if (sid && !sessionIds.includes(sid)) sessionIds.push(sid);
+          }
         }
       }
 
