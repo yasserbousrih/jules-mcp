@@ -72,7 +72,7 @@ describe("Jules MCP Server & Tool Registry v1.6.0", () => {
 
     const listRes = await client.send("tools/list");
     assert.ok(listRes.tools, "tools array must exist");
-    assert.equal(listRes.tools.length, 37, "Must register exactly 37 native tools");
+    assert.equal(listRes.tools.length, 38, "Must register exactly 38 native tools");
 
     const toolNames = listRes.tools.map((t: any) => t.name);
     assert.ok(toolNames.includes("jules_pool_status"));
@@ -204,6 +204,44 @@ describe("Jules MCP Server & Tool Registry v1.6.0", () => {
       prompt: "test deprecated repo",
     });
     assert.ok(res.isError || res.content[0].text.includes("deprecated"));
+  });
+
+  it("should scan repo suggestions with indexed catalog and dry-run", async () => {
+    const res = await client.callTool("jules_run_suggestions", {
+      repo_name: "Agent-Brain",
+      repo_path: "/root/projects/agent-brain",
+      dry_run: true,
+    });
+    assert.ok(res.content && res.content.length >= 2);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.dry_run, true);
+    assert.equal(parsed.repo, "Agent-Brain");
+    assert.ok(typeof parsed.suggestions_found === "number");
+    assert.ok(Array.isArray(parsed.suggestions));
+    assert.ok(parsed.suggestions.length > 0);
+    assert.equal(parsed.suggestions[0].index, 0);
+    assert.ok(parsed.suggestions[0].title);
+    assert.ok(parsed.suggestions[0].target);
+  });
+
+  it("should filter suggestions by specific indices", async () => {
+    const res = await client.callTool("jules_run_suggestions", {
+      repo_name: "Agent-Brain",
+      repo_path: "/root/projects/agent-brain",
+      dry_run: true,
+      indices: [0, 2],
+    });
+    assert.ok(res.content && res.content.length >= 2);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.dry_run, true);
+    assert.equal(parsed.will_dispatch_count, 2);
+    assert.equal(parsed.suggestions[0].selected, true);
+    if (parsed.suggestions.length > 1) {
+      assert.equal(parsed.suggestions[1].selected, false);
+    }
+    if (parsed.suggestions.length > 2) {
+      assert.equal(parsed.suggestions[2].selected, true);
+    }
   });
 
   it("teardown client", () => {
