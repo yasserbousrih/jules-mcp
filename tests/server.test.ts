@@ -244,6 +244,41 @@ describe("Jules MCP Server & Tool Registry v1.6.0", () => {
     }
   });
 
+  it("should validate recipes and reject invalid recipe names in jules_recipe_dispatch", async () => {
+    const res = await client.callTool("jules_recipe_dispatch", {
+      recipe: "non-existent-recipe",
+      source: "Agent-Brain",
+      target_path: "src/index.ts",
+    });
+    assert.ok(res.isError || (res.content && res.content[0].text.includes("Invalid recipe")));
+  });
+
+  it("should validate and reject deprecated repos in batch dispatch", async () => {
+    const res = await client.callTool("jules_batch_dispatch", {
+      tasks: [
+        {
+          source: "email-assistant",
+          prompt: "fix email parser",
+        },
+      ],
+    });
+    assert.ok(res.content && res.content.length > 0);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.ok(Array.isArray(parsed.batch_results));
+    assert.equal(parsed.batch_results[0].status, "error");
+    assert.ok(parsed.batch_results[0].error.includes("deprecated"));
+  });
+
+  it("should run autonomous unblocker across accounts via jules_auto_nudge_all", async () => {
+    const res = await client.callTool("jules_auto_nudge_all", {
+      custom_instruction: "Test autonomous unblocker directive",
+    });
+    assert.ok(res.content && res.content.length >= 2);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.ok(typeof parsed.count === "number");
+    assert.ok(Array.isArray(parsed.nudged));
+  });
+
   it("teardown client", () => {
     if (client) client.close();
   });
