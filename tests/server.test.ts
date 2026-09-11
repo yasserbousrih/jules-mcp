@@ -230,6 +230,7 @@ describe("Jules MCP Server & Tool Registry v1.6.0", () => {
       repo_path: "/root/projects/agent-brain",
       dry_run: true,
       indices: [0, 2],
+      force: true,
     });
     assert.ok(res.content && res.content.length >= 2);
     const parsed = JSON.parse(res.content[0].text);
