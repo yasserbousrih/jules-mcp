@@ -48,6 +48,9 @@ interface SessionOrigin {
   profile: string;
   source: string;
   account?: string;
+  chatId?: string;
+  platform?: string;
+  threadId?: string;
   createdAt: number;
 }
 
@@ -329,6 +332,9 @@ function saveOrigins(ledger: OriginsLedger) {
 
 function recordSessionOrigin(sessionId: string, source: string, profileOverride?: string, account?: string) {
   const profile = profileOverride || detectActiveProfile();
+  const chatId = process.env.HERMES_SESSION_CHAT_ID || undefined;
+  const platform = process.env.HERMES_SESSION_PLATFORM || undefined;
+  const threadId = process.env.HERMES_SESSION_THREAD_ID || undefined;
   const ledger = loadOrigins();
   if (!ledger.sessions) ledger.sessions = {};
   const cleanSid = sessionId.replace(/^sessions\//, "");
@@ -336,6 +342,9 @@ function recordSessionOrigin(sessionId: string, source: string, profileOverride?
     profile,
     source,
     account,
+    chatId,
+    platform,
+    threadId,
     createdAt: Math.floor(Date.now() / 1000),
   };
   saveOrigins(ledger);
