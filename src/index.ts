@@ -10,6 +10,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as https from "https";
 import * as os from "os";
+import * as crypto from "crypto";
 import { execSync, execFileSync } from "child_process";
 
 const CONFIG_PATH = process.env.JULES_CONFIG_PATH || path.join(process.env.HOME || "/root", ".config/jules/keys.json");
@@ -79,6 +80,190 @@ interface FileLock {
 
 interface LocksLedger {
   locks: FileLock[];
+}
+
+// --- Suggestion engine ledger (24h dedup window) ---
+const SUGGESTIONS_PATH = process.env.JULES_SUGGESTIONS_PATH || path.join(process.env.HOME || "/root", ".config/jules/suggestions_ledger.json");
+
+interface SuggestionRecord {
+  fingerprint: string;
+  repo: string;
+  category: string;
+  target: string;
+  sessionId?: string;
+  dispatchedAt: number;
+}
+
+interface SuggestionsLedger {
+  records: SuggestionRecord[];
+}
+
+function loadSuggestionsLedger(): SuggestionsLedger {
+  if (fs.existsSync(SUGGESTIONS_PATH)) {
+    try {
+      return JSON.parse(fs.readFileSync(SUGGESTIONS_PATH, "utf-8"));
+    } catch {}
+  }
+  return { records: [] };
+}
+
+function saveSuggestionsLedger(ledger: SuggestionsLedger) {
+  try {
+    const dir = path.dirname(SUGGESTIONS_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    // Prune records older than 24h
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    ledger.records = ledger.records.filter((r) => r.dispatchedAt > cutoff);
+    fs.writeFileSync(SUGGESTIONS_PATH, JSON.stringify(ledger, null, 2), "utf-8");
+  } catch {}
+}
+
+function fingerprintSuggestion(repo: string, category: string, target: string): string {
+  return crypto.createHash("sha256").update(`${repo}::${category}::${target}`).digest("hex").slice(0, 16);
+}
+
+// Static audit scanner: generates suggestion prompts from local repo analysis
+function scanRepoForSuggestions(repoPath: string, repoName: string): Array<{ category: string; target: string; prompt: string; title: string }> {
+  const suggestions: Array<{ category: string; target: string; prompt: string; title: string }> = [];
+  const EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".py"];
+  const SKIP_DIRS = ["node_modules", ".git", "dist", "build", "__pycache__", ".next", "venv", ".venv", "coverage", ".pytest_cache"];
+
+  const walk = (dir: string, depth: number): string[] => {
+    const files: string[] = [];
+    if (depth > 5) return files;
+    let entries: fs.Dirent[] = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return files;
+    }
+    for (const e of entries) {
+      if (SKIP_DIRS.includes(e.name)) continue;
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        files.push(...walk(full, depth + 1));
+      } else if (EXTENSIONS.some((ext) => e.name.endsWith(ext))) {
+        files.push(full);
+      }
+    }
+    return files;
+  };
+
+  const allFiles = walk(repoPath, 0);
+  const scannedCount = { security: 0, testing: 0, health: 0, perf: 0 };
+
+  for (const file of allFiles) {
+    const rel = path.relative(repoPath, file);
+    let content = "";
+    try {
+      content = fs.readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    if (content.length > 500_000) continue;
+    const lines = content.split("\n");
+
+    // --- SECURITY suggestions ---
+    if (scannedCount.security < 3) {
+      const secPatterns: Array<[RegExp, string]> = [
+        [/cors\(\s*\{\s*origin\s*:\s*true|Access-Control-Allow-Origin["']?\s*,?\s*["']\*/, "overly permissive CORS"],
+        [/(Math\.random\(\))(?![\s\S]{0,80}crypto)/, "insecure randomness (Math.random) for security context"],
+        [/(secret|token|key|password)\s*[:=]\s*["'][^"']{8,}["']/i, "potential hardcoded secret"],
+      ];
+      for (const [pattern, issue] of secPatterns) {
+        const idx = lines.findIndex((l) => pattern.test(l));
+        if (idx >= 0) {
+          suggestions.push({
+            category: "security",
+            target: `${rel}:${idx + 1}`,
+            title: `🔒 Fix ${issue} in ${rel}`,
+            prompt: `# 🔒 Security Vulnerability Fix Task\n\nFix the following security issue in the repository.\n\n## Task Details\n\n**File:** \`${rel}:${idx + 1}\`\n**Issue:** ${issue}\n\n## Your Process\n1. UNDERSTAND the data flow around the vulnerable code.\n2. ASSESS the risk and blast radius.\n3. IMPLEMENT a secure fix following best practices.\n4. VERIFY with lint/tests.\n5. DOCUMENT in the PR description.`,
+          });
+          scannedCount.security++;
+          break;
+        }
+      }
+    }
+
+    // --- TESTING suggestions ---
+    if (scannedCount.testing < 3) {
+      const isTestFile = /\.(test|spec)\.[jt]sx?$/.test(file) || file.includes("/tests/") || file.includes("/test/");
+      const hasErrorHandling = /catch\s*\(|\.catch\(|try\s*\{/.test(content);
+      const testCandidates = /(routes?|controllers?|services?|api)/i.test(rel);
+      if (!isTestFile && hasErrorHandling && testCandidates) {
+        // Look for an exported route/handler without adjacent test coverage
+        const testExists = allFiles.some((f) => f !== file && /\.(test|spec)\./.test(f) && path.basename(f).includes(path.basename(file).split(".")[0]));
+        if (!testExists) {
+          suggestions.push({
+            category: "testing",
+            target: rel,
+            title: `🧪 Add error-path tests for ${rel}`,
+            prompt: `# 🧪 Testing Improvement Task\n\nYou are a testing-focused agent. Analyze \`${rel}\` and add unit tests covering happy paths, edge cases, and error conditions. Follow the repository's existing test framework and patterns. Mock external boundaries (DB clients, fetch, external APIs) deterministically. Run the full suite to verify no regressions.`,
+          });
+          scannedCount.testing++;
+        }
+      }
+    }
+
+    // --- CODE HEALTH suggestions ---
+    if (scannedCount.health < 3) {
+      // console.log/error in source (not test, not scripts)
+      const consoleIdx = lines.findIndex((l) => /console\.(log|error|warn)\(/.test(l));
+      const hasLogger = /require\(['"].*logger|import.*logger|from ['"].*logger/.test(content);
+      if (consoleIdx >= 0 && hasLogger) {
+        suggestions.push({
+          category: "code-health",
+          target: `${rel}:${consoleIdx + 1}`,
+          title: `🧹 Replace console.* with structured logger in ${rel}`,
+          prompt: `# 🧹 Code Health Improvement Task\n\nReplace direct \`console.log/error/warn\` calls in \`${rel}\` with the project's structured logger. Keep behavior identical. Run lint and tests to verify.`,
+        });
+        scannedCount.health++;
+      } else {
+        const todoIdx = lines.findIndex((l) => /\/\/\s*(TODO|FIXME|HACK)/.test(l) || /#\s*(TODO|FIXME|HACK)/.test(l));
+        if (todoIdx >= 0) {
+          suggestions.push({
+            category: "code-health",
+            target: `${rel}:${todoIdx + 1}`,
+            title: `🧹 Resolve stale TODO/FIXME in ${rel}`,
+            prompt: `# 🧹 Code Health Improvement Task\n\nAudit \`${rel}\` around line ${todoIdx + 1} where a TODO/FIXME/HACK marker exists. Either implement the missing work if trivially resolvable or remove the obsolete marker if it is already addressed. Preserve functionality; run tests to verify.`,
+          });
+          scannedCount.health++;
+        }
+      }
+    }
+
+    // --- PERFORMANCE suggestions ---
+    if (scannedCount.perf < 2) {
+      // Sequential awaits inside for/while loops = N+1 pattern
+      let nPlus1Line = -1;
+      for (let i = 0; i < lines.length; i++) {
+        const l = lines[i];
+        if (/for\s*\(|\.forEach\(|while\s*\(/.test(l)) {
+          // check next few lines for awaited calls
+          for (let j = i + 1; j < Math.min(i + 6, lines.length); j++) {
+            if (/await\s+\w+[.(]/.test(lines[j])) {
+              nPlus1Line = j;
+              break;
+            }
+          }
+          if (nPlus1Line > 0) break;
+        }
+      }
+      if (nPlus1Line > 0) {
+        suggestions.push({
+          category: "performance",
+          target: `${rel}:${nPlus1Line}`,
+          title: `⚡ Fix N+1 sequential await pattern in ${rel}`,
+          prompt: `# ⚡ Performance Optimization Task\n\n\`${rel}\` contains a loop with sequential awaited calls (N+1 pattern) around line ${nPlus1Line}. Refactor to batch DB operations (createMany/insert many) or parallelize independent calls with Promise.all. Preserve behavior and ordering guarantees where they matter. Run tests to verify.`,
+        });
+        scannedCount.perf++;
+      }
+    }
+
+    if (scannedCount.security >= 3 && scannedCount.testing >= 3 && scannedCount.health >= 3 && scannedCount.perf >= 2) break;
+  }
+
+  return suggestions;
 }
 
 interface RepoEnvsMap {
@@ -360,9 +545,9 @@ const CHORE_RECIPES: Record<string, ChoreRecipe> = {
   },
   "clean-dead-code": {
     name: "Clean Dead Code & Unused Imports",
-    description: "Safely identify and remove unused imports, dead variables, unreachable statements, and deprecated private helpers.",
+    description: "Safely identify and remove unused imports, dead variables, unreachable statements, and deprecated private helpers across a module or directory.",
     buildPrompt: (target, extra) =>
-      `Audit \`${target}\` and safely remove unused imports, unused local variables, and unreachable code blocks. Do NOT remove public API exports or break existing functionality.${extra ? ` Instructions: ${extra}` : ""}`,
+      `Audit \`${target}\` comprehensively and safely remove all unused imports, unused local variables, and unreachable dead code blocks across the target module/files in a single cohesive pass. Do NOT split this into single-line micro changes. Do NOT remove public API exports or break existing functionality.${extra ? ` Instructions: ${extra}` : ""}`,
   },
   "refactor-isolated-helper": {
     name: "Refactor Isolated Helper",
@@ -570,19 +755,19 @@ async function getLeastLoadedAccount(): Promise<Account> {
   if (accounts.length === 1) return accounts[0];
 
   const quotaStatus = getQuotaStatus();
-  const loads: { account: Account; inFlight: number; used24h: number; remaining: number }[] = [];
-
-  for (const acc of accounts) {
-    const accKey = acc.name || acc.email || "Account";
-    const q = quotaStatus[accKey] || { usedLast24h: 0, remaining: 15 };
-    try {
-      const res = await request("sessions?pageSize=20", acc.key);
-      const inFlight = (res.sessions || []).filter((s: any) => s.state === "IN_PROGRESS").length;
-      loads.push({ account: acc, inFlight, used24h: q.usedLast24h, remaining: q.remaining });
-    } catch {
-      loads.push({ account: acc, inFlight: 99, used24h: q.usedLast24h, remaining: q.remaining });
-    }
-  }
+  const loads = await Promise.all(
+    accounts.map(async (acc) => {
+      const accKey = acc.name || acc.email || "Account";
+      const q = quotaStatus[accKey] || { usedLast24h: 0, remaining: 15 };
+      try {
+        const res = await request("sessions?pageSize=20", acc.key);
+        const inFlight = (res.sessions || []).filter((s: any) => s.state === "IN_PROGRESS").length;
+        return { account: acc, inFlight, used24h: q.usedLast24h, remaining: q.remaining };
+      } catch {
+        return { account: acc, inFlight: 99, used24h: q.usedLast24h, remaining: q.remaining };
+      }
+    })
+  );
 
   loads.sort((a, b) => {
     if (a.remaining > 0 && b.remaining === 0) return -1;
@@ -633,10 +818,11 @@ Never commit or stage the .env file or credentials into git commits, patches, or
 
   const antiPauseGuard = `
 CRITICAL AUTONOMOUS EXECUTION DIRECTIVES:
-1. Work completely autonomously: do NOT pause or ask questions.
-2. If choice is needed, pick the standard TypeScript/Python stdlib approach.
-3. Make small, surgical, modular diffs. Do NOT rewrite working code.
-4. Execute tests in sandbox and clean up temporary logs/debug files before final commit.
+1. Work completely autonomously: do NOT pause or ask questions under any circumstances.
+2. If choices arise regarding DB batch sizes or test mocking, default to standard mocking of client boundaries (pg/fetch/withTransaction) with batch sizes of 50-100 items.
+3. If choice is needed, pick the standard TypeScript/Python stdlib approach.
+4. Make small, surgical, modular diffs. Do NOT rewrite working code.
+5. Execute tests in sandbox and clean up temporary logs, debug files, test-plan.md, and eslint outputs before final commit.
 `;
 
   return `${rawPrompt.trim()}${invariant}${envDirective}${verificationDirective}\n${antiPauseGuard}`.trim();
@@ -787,6 +973,46 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           },
           required: ["recipe", "source", "target_path"],
+        },
+      },
+      {
+        name: "jules_run_suggestions",
+        description: "Autonomous audit runner: scans a local repository for security vulnerabilities (permissive CORS, Math.random, hardcoded secrets), missing test coverage, code health issues (console.* vs logger, stale TODOs), and N+1 performance patterns. Generates templated suggestion tasks, deduplicates against a 24h ledger, and batch-dispatches them all to Google Jules automatically.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            repo_name: {
+              type: "string",
+              description: "GitHub repository name for Jules dispatch (e.g. 'Agent-Brain').",
+            },
+            repo_path: {
+              type: "string",
+              description: "Absolute local path of the repository to scan (e.g. '/root/projects/agent-brain').",
+            },
+            categories: {
+              type: "array",
+              items: { type: "string", enum: ["security", "testing", "code-health", "performance"] },
+              description: "Categories to include (default: all).",
+            },
+            dry_run: {
+              type: "boolean",
+              description: "If true, only lists generated suggestions without dispatching (default false).",
+            },
+            auto_create_pr: {
+              type: "boolean",
+              description: "If true, Jules opens GitHub PRs directly (default true).",
+            },
+            indices: {
+              type: "array",
+              items: { type: "integer" },
+              description: "Optional array of 0-based suggestion indices/positions to inspect or trigger (e.g. [0, 2]).",
+            },
+            force: {
+              type: "boolean",
+              description: "If true, ignores the 24h deduplication ledger and triggers selected suggestions anyway (default false).",
+            },
+          },
+          required: ["repo_name", "repo_path"],
         },
       },
       {
@@ -1902,6 +2128,216 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     }
 
     // ----------------------------------------------------
+    // TOOL: jules_run_suggestions (Autonomous audit → dispatch)
+    // ----------------------------------------------------
+    if (name === "jules_run_suggestions") {
+      const repoName = args.repo_name as string;
+      const repoPath = path.resolve(args.repo_path as string);
+      const categoriesFilter = (args.categories as string[] | undefined) || null;
+      const dryRun = !!args.dry_run;
+      const autoCreatePr = args.auto_create_pr !== false;
+      const requestedIndices = Array.isArray(args.indices) ? (args.indices as number[]) : null;
+      const force = !!args.force;
+
+      if (!fs.existsSync(repoPath) || !fs.statSync(repoPath).isDirectory()) {
+        throw new Error(`Directory does not exist: ${repoPath}`);
+      }
+
+      const cleanRepo = repoName.toLowerCase().replace(/^sources\/github\/[^/]+\//, "");
+      if (DEPRECATED_REPOS[cleanRepo]) {
+        throw new Error(`Repository '${cleanRepo}' is deprecated. Reason: ${DEPRECATED_REPOS[cleanRepo]}`);
+      }
+
+      // 1. Scan local repo for suggestions
+      const allSuggestions = scanRepoForSuggestions(repoPath, repoName);
+      const suggestions = categoriesFilter
+        ? allSuggestions.filter((s) => categoriesFilter.includes(s.category))
+        : allSuggestions;
+
+      if (suggestions.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ repo: repoName, scanned: true, suggestions_found: 0, dispatched: 0 }, null, 2),
+            },
+            {
+              type: "text",
+              text: `### Suggestion Scan Complete: \`${repoName}\`\n\n✅ No new audit findings in the selected categories. Nothing dispatched.`,
+            },
+          ],
+        };
+      }
+
+      // 2. Dedupe against 24h ledger
+      const ledger = loadSuggestionsLedger();
+      const knownFingerprints = new Set(ledger.records.map((r) => r.fingerprint));
+      const fresh = suggestions.filter((s) => !knownFingerprints.has(fingerprintSuggestion(repoName, s.category, s.target)));
+      const skipped = suggestions.length - fresh.length;
+
+      if (dryRun) {
+        const indexedList = suggestions.map((s, idx) => {
+          const isFresh = !knownFingerprints.has(fingerprintSuggestion(repoName, s.category, s.target));
+          const selected = requestedIndices ? requestedIndices.includes(idx) : true;
+          return {
+            index: idx,
+            category: s.category,
+            target: s.target,
+            title: s.title,
+            is_fresh: isFresh,
+            selected,
+            action_preview: selected && (isFresh || force) ? "WILL_DISPATCH" : "SKIP",
+          };
+        });
+
+        const wouldDispatch = indexedList.filter((item) => item.action_preview === "WILL_DISPATCH");
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  repo: repoName,
+                  dry_run: true,
+                  force,
+                  requested_indices: requestedIndices,
+                  suggestions_found: suggestions.length,
+                  fresh_count: fresh.length,
+                  skipped_24h_count: skipped,
+                  will_dispatch_count: wouldDispatch.length,
+                  suggestions: indexedList,
+                },
+                null,
+                2
+              ),
+            },
+            {
+              type: "text",
+              text:
+                `### 🔍 Suggestion Audit: \`${repoName}\` (Dry Run)\n\n` +
+                `• **Total Found:** ${suggestions.length}\n` +
+                `• **Fresh:** ${fresh.length} | **24h Ledger Skipped:** ${skipped}\n` +
+                `• **Targeted for Dispatch:** ${wouldDispatch.length}\n\n` +
+                suggestions
+                  .map((s, idx) => {
+                    const isFresh = !knownFingerprints.has(fingerprintSuggestion(repoName, s.category, s.target));
+                    const selected = requestedIndices ? requestedIndices.includes(idx) : true;
+                    const willRun = selected && (isFresh || force);
+                    const tag = willRun ? "🚀 [READY]" : !selected ? "⚪ [UNSELECTED]" : "⏳ [24h LEDGER DEDUP]";
+                    return `**[#${idx}]** ${s.title} ${tag}\n   - **Category:** \`${s.category}\` | **Target:** \`${s.target}\``;
+                  })
+                  .join("\n\n"),
+            },
+          ],
+        };
+      }
+
+      let toDispatch = suggestions.filter((s, idx) => {
+        if (requestedIndices && !requestedIndices.includes(idx)) {
+          return false;
+        }
+        if (force) {
+          return true;
+        }
+        return !knownFingerprints.has(fingerprintSuggestion(repoName, s.category, s.target));
+      });
+
+      if (toDispatch.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ repo: repoName, suggestions_found: suggestions.length, skipped_duplicates: skipped, dispatched: 0 }, null, 2),
+            },
+            {
+              type: "text",
+              text: `### Suggestion Audit: \`${repoName}\`\n\nNo eligible suggestions to dispatch (either filtered by index or all were dispatched within the last 24h). Pass \`force: true\` to override.`,
+            },
+          ],
+        };
+      }
+
+      // 3. Dispatch each suggestion to Jules
+      const sourceResource = `sources/github/yasserbousrih/${repoName.replace(/^sources\/github\/[^/]+\//, "")}`;
+      const dispatchResults: any[] = [];
+
+      for (const s of toDispatch) {
+        const fingerprint = fingerprintSuggestion(repoName, s.category, s.target);
+        try {
+          const decoratedPrompt = decoratePrompt(s.prompt, repoName);
+          const payload: any = {
+            prompt: decoratedPrompt,
+            title: s.title,
+            sourceContext: {
+              source: sourceResource,
+              githubRepoContext: { startingBranch: "main" },
+            },
+            automationMode: autoCreatePr ? "AUTO_CREATE_PR" : "AUTOMATION_MODE_UNSPECIFIED",
+            requirePlanApproval: false,
+          };
+
+          const bestAccount = await getLeastLoadedAccount();
+          const created = await request("sessions", bestAccount.key, { method: "POST" }, payload);
+          const sid = created.id || created.name?.replace("sessions/", "");
+          recordDispatch(bestAccount.name || bestAccount.email || "Account", sid, sourceResource);
+          acquireFileLock(repoName, s.target, sid, bestAccount.name || bestAccount.email || "Account");
+
+          ledger.records.push({
+            fingerprint,
+            repo: repoName,
+            category: s.category,
+            target: s.target,
+            sessionId: sid,
+            dispatchedAt: Date.now(),
+          });
+
+          dispatchResults.push({
+            status: "success",
+            category: s.category,
+            title: s.title,
+            session_id: sid,
+            account: bestAccount.name || bestAccount.email,
+            web_url: created.url || `https://jules.google.com/session/${sid}`,
+          });
+        } catch (err: any) {
+          dispatchResults.push({ status: "error", category: s.category, title: s.title, error: err.message });
+        }
+      }
+
+      saveSuggestionsLedger(ledger);
+
+      const okCount = dispatchResults.filter((r) => r.status === "success").length;
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                repo: repoName,
+                scanned: true,
+                suggestions_found: suggestions.length,
+                skipped_duplicates_24h: skipped,
+                dispatched: okCount,
+                failed: dispatchResults.length - okCount,
+                results: dispatchResults,
+              },
+              null,
+              2
+            ),
+          },
+          {
+            type: "text",
+            text: `### Autonomous Suggestion Run: \`${repoName}\`\n\n` +
+              `• **Findings:** ${suggestions.length} (skipped ${skipped} already dispatched in 24h)\n` +
+              `• **Dispatched:** ${okCount} / ${dispatchResults.length}\n\n` +
+              dispatchResults.map((r) => (r.status === "success" ? `- ✅ ${r.title} → \`${r.session_id}\`` : `- ❌ ${r.title}: ${r.error}`)).join("\n"),
+          },
+        ],
+      };
+    }
+
+    // ----------------------------------------------------
     // TOOL 6: jules_verify_patch (Dry-Run Conflict Check)
     // ----------------------------------------------------
     if (name === "jules_verify_patch") {
@@ -2414,9 +2850,15 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
         }
       }
 
+      // Sanitize transient sandbox test artifacts before committing or applying
+      try {
+        execSync("rm -f test-plan.md eslint-output*.txt fix-*.js .jules-temp* 2>/dev/null || true", { cwd: repoPath });
+      } catch {}
+
       let committed = false;
       if (autoCommit && testPassed) {
         try {
+          execSync("rm -f test-plan.md eslint-output*.txt fix-*.js .jules-temp* 2>/dev/null || true", { cwd: repoPath });
           execSync(`git add -A && git commit -m "${commitMessage.replace(/"/g, '\\"')}"`, {
             cwd: repoPath,
             stdio: "pipe",
@@ -2552,23 +2994,31 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
       let allSources: any[] = [];
       const seenSources = new Set<string>();
 
-      for (const acc of accounts) {
-        try {
-          let qs = `pageSize=${pageSize}`;
-          if (pageToken) qs += `&pageToken=${encodeURIComponent(pageToken)}`;
-          if (filter) qs += `&filter=${encodeURIComponent(filter)}`;
+      let qs = `pageSize=${pageSize}`;
+      if (pageToken) qs += `&pageToken=${encodeURIComponent(pageToken)}`;
+      if (filter) qs += `&filter=${encodeURIComponent(filter)}`;
 
-          const res = await request(`sources?${qs}`, acc.key);
-          for (const s of res.sources || []) {
-            if (!seenSources.has(s.name)) {
-              seenSources.add(s.name);
-              allSources.push({
-                ...s,
-                _account: acc.name || acc.email,
-              });
-            }
+      const results = await Promise.all(
+        accounts.map(async (acc) => {
+          try {
+            const res = await request(`sources?${qs}`, acc.key);
+            return { acc, sources: res.sources || [] };
+          } catch {
+            return { acc, sources: [] };
           }
-        } catch {}
+        })
+      );
+
+      for (const { acc, sources } of results) {
+        for (const s of sources) {
+          if (!seenSources.has(s.name)) {
+            seenSources.add(s.name);
+            allSources.push({
+              ...s,
+              _account: acc.name || acc.email,
+            });
+          }
+        }
       }
 
       return {
@@ -2754,39 +3204,47 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
       let allSessions: any[] = [];
       const seenSessions = new Set<string>();
 
-      for (const acc of accounts) {
-        try {
-          let qs = `pageSize=${pageSize}`;
-          if (pageToken) qs += `&pageToken=${encodeURIComponent(pageToken)}`;
-          if (filter) qs += `&filter=${encodeURIComponent(filter)}`;
+      let qs = `pageSize=${pageSize}`;
+      if (pageToken) qs += `&pageToken=${encodeURIComponent(pageToken)}`;
+      if (filter) qs += `&filter=${encodeURIComponent(filter)}`;
 
-          const res = await request(`sessions?${qs}`, acc.key);
-          for (const s of res.sessions || []) {
-            const sid = s.id || s.name?.replace("sessions/", "");
-            if (!seenSessions.has(sid)) {
-              seenSessions.add(sid);
-
-              const origin = origins.sessions?.[sid];
-              const sessionProfile = origin?.profile || "unknown";
-
-              if (profileFilter && profileFilter.toLowerCase() !== "all" && sessionProfile.toLowerCase() !== profileFilter.toLowerCase()) {
-                continue;
-              }
-              if (state && s.state && s.state.toLowerCase() !== state.toLowerCase()) {
-                continue;
-              }
-              if (source && s.sourceContext?.source && !s.sourceContext.source.toLowerCase().includes(source.toLowerCase())) {
-                continue;
-              }
-
-              allSessions.push({
-                ...s,
-                _account: acc.name || acc.email,
-                _origin_profile: sessionProfile,
-              });
-            }
+      const results = await Promise.all(
+        accounts.map(async (acc) => {
+          try {
+            const res = await request(`sessions?${qs}`, acc.key);
+            return { acc, sessions: res.sessions || [] };
+          } catch {
+            return { acc, sessions: [] };
           }
-        } catch {}
+        })
+      );
+
+      for (const { acc, sessions } of results) {
+        for (const s of sessions) {
+          const sid = s.id || s.name?.replace("sessions/", "");
+          if (!seenSessions.has(sid)) {
+            seenSessions.add(sid);
+
+            const origin = origins.sessions?.[sid];
+            const sessionProfile = origin?.profile || "unknown";
+
+            if (profileFilter && profileFilter.toLowerCase() !== "all" && sessionProfile.toLowerCase() !== profileFilter.toLowerCase()) {
+              continue;
+            }
+            if (state && s.state && s.state.toLowerCase() !== state.toLowerCase()) {
+              continue;
+            }
+            if (source && s.sourceContext?.source && !s.sourceContext.source.toLowerCase().includes(source.toLowerCase())) {
+              continue;
+            }
+
+            allSessions.push({
+              ...s,
+              _account: acc.name || acc.email,
+              _origin_profile: sessionProfile,
+            });
+          }
+        }
       }
 
       return {
@@ -3273,44 +3731,48 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     if (name === "jules_pool_status") {
       const accounts = getAccounts();
       const quotaStatus = getQuotaStatus();
-      const status: any[] = [];
-      let totalActive = 0;
-      let totalCompleted = 0;
-      let totalUsed24h = 0;
 
-      for (let i = 0; i < accounts.length; i++) {
-        const acc = accounts[i];
-        const accName = acc.name || acc.email || `Account-${i + 1}`;
-        const q = quotaStatus[accName] || { usedLast24h: 0, remaining: 15, nextResetMinutes: undefined };
-        totalUsed24h += q.usedLast24h;
+      const status = await Promise.all(
+        accounts.map(async (acc, i) => {
+          const accName = acc.name || acc.email || `Account-${i + 1}`;
+          const q = quotaStatus[accName] || { usedLast24h: 0, remaining: 15, nextResetMinutes: undefined };
 
-        try {
-          const res = await request("sessions?pageSize=50", acc.key);
-          const sessions = res.sessions || [];
-          const active = sessions.filter((s: any) => s.state === "IN_PROGRESS").length;
-          const completed = sessions.filter((s: any) => s.state === "COMPLETED").length;
-          totalActive += active;
-          totalCompleted += completed;
+          try {
+            const res = await request("sessions?pageSize=50", acc.key);
+            const sessions = res.sessions || [];
+            const active = sessions.filter((s: any) => s.state === "IN_PROGRESS").length;
+            const completed = sessions.filter((s: any) => s.state === "COMPLETED").length;
 
-          status.push({
-            account: accName,
-            status: "ACTIVE",
-            daily_limit: 15,
-            used_last_24h: q.usedLast24h,
-            remaining_24h_quota: q.remaining,
-            next_reset_in_minutes: q.nextResetMinutes ?? 0,
-            active_sessions: active,
-            completed_sessions: completed,
-            total_loaded: sessions.length,
-          });
-        } catch (err: any) {
-          status.push({
-            account: accName,
-            status: "ERROR",
-            error: err.message,
-          });
-        }
-      }
+            return {
+              account: accName,
+              status: "ACTIVE",
+              daily_limit: 15,
+              used_last_24h: q.usedLast24h,
+              remaining_24h_quota: q.remaining,
+              next_reset_in_minutes: q.nextResetMinutes ?? 0,
+              active_sessions: active,
+              completed_sessions: completed,
+              total_loaded: sessions.length,
+            };
+          } catch (err: any) {
+            return {
+              account: accName,
+              status: "ERROR",
+              error: err.message,
+              used_last_24h: q.usedLast24h,
+              remaining_24h_quota: q.remaining,
+              next_reset_in_minutes: q.nextResetMinutes ?? 0,
+              active_sessions: 0,
+              completed_sessions: 0,
+              total_loaded: 0,
+            };
+          }
+        })
+      );
+
+      const totalUsed24h = status.reduce((sum, s) => sum + (s.used_last_24h || 0), 0);
+      const totalActive = status.reduce((sum, s) => sum + (s.active_sessions || 0), 0);
+      const totalCompleted = status.reduce((sum, s) => sum + (s.completed_sessions || 0), 0);
 
       return {
         content: [
