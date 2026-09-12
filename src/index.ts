@@ -3979,7 +3979,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
 async function run() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  process.stderr.write("Jules MCP Server running on stdio (34 tools)\n");
+  process.stderr.write("Jules MCP Server running on stdio (38 tools)\n");
 }
 
 run().catch((error) => {
