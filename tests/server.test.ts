@@ -66,7 +66,7 @@ class TestMcpClient {
 describe("Jules MCP Server & Tool Registry v1.6.0", () => {
   let client: TestMcpClient;
 
-  it("should initialize MCP server and register 34 tools", async () => {
+  it("should initialize MCP server and register 38 tools", async () => {
     client = new TestMcpClient();
     await client.init();
 
