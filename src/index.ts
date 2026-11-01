@@ -964,7 +964,56 @@ function saveWatchdogState(state: WatchdogState) {
   } catch {}
 }
 
+function safeSendLoggingMessage(params: any): void {
+  try {
+    const res: any = safeSendLoggingMessage(params);
+    if (res && typeof res.catch === "function") {
+      res.catch(() => {});
+    }
+  } catch {}
+}
+
+async function sendTelegramAlert(text: string): Promise<void> {
+  const token = process.env.JULES_TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.JULES_TELEGRAM_CHAT_ID;
+  if (!token || !chatId) return;
+
+  try {
+    const body = JSON.stringify({
+      chat_id: chatId,
+      text,
+      parse_mode: "Markdown",
+    });
+
+    const parsed = new URL(`https://api.telegram.org/bot${token}/sendMessage`);
+    const options: https.RequestOptions = {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+      },
+    };
+
+    const req = https.request(parsed, options);
+    req.on("error", () => {});
+    req.write(body);
+    req.end();
+  } catch {}
+}
+
 async function dispatchWebhookEvent(event: JulesEvent): Promise<void> {
+  // 1. Direct Telegram Alert if configured
+  if (event.type === "session_stuck") {
+    const msg = `🚨 *[Jules Watchdog] Task Stuck (Needs Input)*\n• *Repo:* \`${event.repo || "Unknown"}\` | *ID:* \`${event.session_id}\` [${event.account || ""}]\n• *Title:* ${event.title || ""}\n• *Question:* _"${event.question || ""}"_\n👉 *Reply:* \`jules_reply_feedback(session_id='${event.session_id}', message='<answer>')\``;
+    sendTelegramAlert(msg).catch(() => {});
+  } else if (event.type === "pr_created") {
+    const msg = `🎉 *[Jules Watchdog] PR Created & Ready to Merge*\n• *Repo:* \`${event.repo || "Unknown"}\`\n• *Title:* ${event.title || ""}\n• *PR:* ${event.pr_url || ""}`;
+    sendTelegramAlert(msg).catch(() => {});
+  } else if (event.type === "task_failed") {
+    const msg = `❌ *[Jules Watchdog] Task Failed*\n• *Repo:* \`${event.repo || "Unknown"}\` | *ID:* \`${event.session_id}\`\n• *Reason:* ${event.error || "Unknown"}`;
+    sendTelegramAlert(msg).catch(() => {});
+  }
+
   const webhookUrl = process.env.JULES_WEBHOOK_URL;
   if (!webhookUrl) return;
 
@@ -1081,7 +1130,7 @@ export async function runWatchdogCycle(): Promise<{ stuckCount: number; prCount:
             alerts.push(alertMsg);
 
             try {
-              server.sendLoggingMessage({
+              safeSendLoggingMessage({
                 level: "warning",
                 data: alertMsg,
                 logger: "jules-watchdog",
@@ -1101,7 +1150,7 @@ export async function runWatchdogCycle(): Promise<{ stuckCount: number; prCount:
                   details: { auto_nudge: true, directive },
                 });
                 try {
-                  server.sendLoggingMessage({
+                  safeSendLoggingMessage({
                     level: "info",
                     data: `⚡ [Jules Watchdog] Auto-unblocked session ${sid} with standard anti-pause directive.`,
                     logger: "jules-watchdog",
@@ -1134,7 +1183,7 @@ export async function runWatchdogCycle(): Promise<{ stuckCount: number; prCount:
               alerts.push(prMsg);
 
               try {
-                server.sendLoggingMessage({
+                safeSendLoggingMessage({
                   level: "info",
                   data: prMsg,
                   logger: "jules-watchdog",
@@ -1160,7 +1209,7 @@ export async function runWatchdogCycle(): Promise<{ stuckCount: number; prCount:
           alerts.push(failMsg);
 
           try {
-            server.sendLoggingMessage({
+            safeSendLoggingMessage({
               level: "error",
               data: failMsg,
               logger: "jules-watchdog",
