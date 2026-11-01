@@ -70,13 +70,13 @@ class TestMcpClient {
 describe("Jules MCP Server & Tool Registry v1.6.0", () => {
   let client: TestMcpClient;
 
-  it("should initialize MCP server and register 49 tools", async () => {
+  it("should initialize MCP server and register 53 tools", async () => {
     client = new TestMcpClient();
     await client.init();
 
     const listRes = await client.send("tools/list");
     assert.ok(listRes.tools, "tools array must exist");
-    assert.equal(listRes.tools.length, 49, "Must register exactly 38 native tools");
+    assert.equal(listRes.tools.length, 53, "Must register exactly 38 native tools");
 
     const toolNames = listRes.tools.map((t: any) => t.name);
     assert.ok(toolNames.includes("jules_pool_status"));
@@ -93,6 +93,32 @@ describe("Jules MCP Server & Tool Registry v1.6.0", () => {
     assert.ok(toolNames.includes("jules_queue_status"));
     assert.ok(toolNames.includes("jules_drain_queue"));
     assert.ok(toolNames.includes("jules_inspect_locks"));
+  });
+
+  it("should evaluate plans via jules_plan_critic and execute workspace exporter via jules_export_workspace", async () => {
+    // 1. Plan critic on completed/mock session
+    const criticRes = await client.callTool("jules_plan_critic", {
+      session_id: "6613958527716964992",
+    });
+    assert.ok(criticRes.content && criticRes.content.length >= 2);
+    const criticParsed = JSON.parse(criticRes.content[0].text);
+    assert.ok(typeof criticParsed.steps_count === "number");
+    assert.ok(Array.isArray(criticParsed.flaws));
+
+    // 2. Export workspace to temporary folder
+    const tmpExport = path.join(os.tmpdir(), "jules-test-export-" + Date.now());
+    const expRes = await client.callTool("jules_export_workspace", {
+      output_dir: tmpExport,
+      include_patches: true,
+    });
+    assert.ok(expRes.content && expRes.content.length >= 2);
+    const expParsed = JSON.parse(expRes.content[0].text);
+    assert.equal(expParsed.exported, true);
+    assert.ok(fs.existsSync(path.join(tmpExport, "sources.json")));
+    assert.ok(fs.existsSync(path.join(tmpExport, "scheduled-tasks.json")));
+
+    // Cleanup tmp export
+    fs.rmSync(tmpExport, { recursive: true, force: true });
   });
 
   it("should schedule and manage recurring tasks via jules_schedule_task and jules_list_schedules", async () => {

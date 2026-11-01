@@ -1,7 +1,7 @@
 {
   "name": "jules-mcp",
-  "version": "1.8.0",
-  "description": "Universal Model Context Protocol (MCP) Server, Autonomous Scheduler, Memory Engine & CLI for Google Jules Cloud Agent - recurring schedules, setup scripts, agentic memories, commit authorship, CI auto-healer, multi-account rotation, and cross-harness notifications (Hermes, Claude Code, Cursor, Codex, Windsurf)",
+  "version": "2.0.0",
+  "description": "Universal Model Context Protocol (MCP) Server, Autonomous Scheduler, CI Auto-Healer, Issue Dispatcher, Workspace Exporter & CLI for Google Jules Cloud Agent across AI harnesses (Hermes, Claude Code, Cursor, Codex, Windsurf)",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
