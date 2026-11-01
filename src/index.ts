@@ -834,9 +834,9 @@ function resolveCanonicalSource(input: string): string {
 }
 
 // Select account with lowest active load & guaranteed rolling 24h quota
-async function getLeastLoadedAccount(): Promise<Account> {
+async function getAccountsSortedByLoad(): Promise<Account[]> {
   const accounts = getAccounts();
-  if (accounts.length === 1) return accounts[0];
+  if (accounts.length <= 1) return accounts;
 
   const quotaStatus = getQuotaStatus();
   const TERMINAL_STATES = ["COMPLETED", "FAILED", "CANCELLED", "STATE_UNSPECIFIED"];
@@ -856,7 +856,6 @@ async function getLeastLoadedAccount(): Promise<Account> {
     })
   );
 
-  // Priority: accounts under 5 concurrent > quota remaining > lowest inFlight > lowest used24h
   loads.sort((a, b) => {
     const aUnderCap = a.inFlight < 5 ? 0 : 1;
     const bUnderCap = b.inFlight < 5 ? 0 : 1;
@@ -867,7 +866,36 @@ async function getLeastLoadedAccount(): Promise<Account> {
     return a.used24h - b.used24h;
   });
 
-  return loads[0].account;
+  return loads.map((l) => l.account);
+}
+
+async function getLeastLoadedAccount(): Promise<Account> {
+  const sorted = await getAccountsSortedByLoad();
+  return sorted[0];
+}
+
+async function createSessionWithFallback(payload: any, specificAccount?: string): Promise<{ data: any; account: Account }> {
+  let candidates: Account[] = [];
+  if (specificAccount) {
+    const accounts = getAccounts();
+    const matched = accounts.find((a) => (a.name || "").includes(specificAccount) || (a.email || "").includes(specificAccount));
+    if (matched) candidates = [matched];
+    else candidates = accounts;
+  } else {
+    candidates = await getAccountsSortedByLoad();
+  }
+
+  let lastError: any = null;
+  for (const acc of candidates) {
+    try {
+      const data = await request("sessions", acc.key, { method: "POST" }, payload);
+      return { data, account: acc };
+    } catch (err: any) {
+      lastError = err;
+    }
+  }
+
+  throw lastError || new Error("Failed to create session across all available accounts in pool.");
 }
 
 // Decorate prompt with Architectural Invariants, Sandboxed Environment Variables, Container Test Run Directives & Anti-Pause autonomous instructions
@@ -2939,11 +2967,10 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
             requirePlanApproval: false,
           };
 
-          const bestAccount = await getLeastLoadedAccount();
-          const created = await request("sessions", bestAccount.key, { method: "POST" }, payload);
+          const { data: created, account: chosenAccount } = await createSessionWithFallback(payload);
           const sid = created.id || created.name?.replace("sessions/", "");
-          recordDispatch(bestAccount.name || bestAccount.email || "Account", sid, sourceResource);
-          acquireFileLock(repoName, s.target, sid, bestAccount.name || bestAccount.email || "Account");
+          recordDispatch(chosenAccount.name || chosenAccount.email || "Account", sid, sourceResource);
+          acquireFileLock(repoName, s.target, sid, chosenAccount.name || chosenAccount.email || "Account");
 
           ledger.records.push({
             fingerprint,
@@ -2959,7 +2986,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
             category: s.category,
             title: s.title,
             session_id: sid,
-            account: bestAccount.name || bestAccount.email,
+            account: chosenAccount.name || chosenAccount.email,
             web_url: created.url || `https://jules.google.com/session/${sid}`,
           });
         } catch (err: any) {
