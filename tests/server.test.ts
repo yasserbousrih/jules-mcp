@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 import * as cp from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as os from "node:os";
+
+const defaultRepoPath = process.env.JULES_TEST_REPO_PATH || (fs.existsSync("/root/projects/agent-brain") ? "/root/projects/agent-brain" : process.cwd());
 
 class TestMcpClient {
   private proc: cp.ChildProcess;
@@ -11,7 +14,8 @@ class TestMcpClient {
   private nextId = 1;
 
   constructor() {
-    this.proc = cp.spawn("node", ["/root/projects/jules-mcp/dist/index.js"], {
+    const distPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../dist/index.js");
+    this.proc = cp.spawn("node", [distPath], {
       stdio: ["pipe", "pipe", "inherit"],
     });
 
@@ -66,13 +70,13 @@ class TestMcpClient {
 describe("Jules MCP Server & Tool Registry v1.6.0", () => {
   let client: TestMcpClient;
 
-  it("should initialize MCP server and register 38 tools", async () => {
+  it("should initialize MCP server and register 41 tools", async () => {
     client = new TestMcpClient();
     await client.init();
 
     const listRes = await client.send("tools/list");
     assert.ok(listRes.tools, "tools array must exist");
-    assert.equal(listRes.tools.length, 38, "Must register exactly 38 native tools");
+    assert.equal(listRes.tools.length, 41, "Must register exactly 38 native tools");
 
     const toolNames = listRes.tools.map((t: any) => t.name);
     assert.ok(toolNames.includes("jules_pool_status"));
@@ -157,6 +161,31 @@ describe("Jules MCP Server & Tool Registry v1.6.0", () => {
     assert.ok(Array.isArray(parsed.locks));
   });
 
+  it("should trigger immediate watchdog cycle via jules_poll_watchdog", async () => {
+    const res = await client.callTool("jules_poll_watchdog");
+    assert.ok(res.content && res.content.length >= 2);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.ok(typeof parsed.stuckCount === "number");
+    assert.ok(typeof parsed.prCount === "number");
+    assert.ok(Array.isArray(parsed.alerts));
+  });
+
+  it("should query cross-harness event ledger via jules_get_events", async () => {
+    const res = await client.callTool("jules_get_events", { limit: 10 });
+    assert.ok(res.content && res.content.length >= 2);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.ok(typeof parsed.count === "number");
+    assert.ok(Array.isArray(parsed.events));
+  });
+
+  it("should scan stuck sessions with exact question extraction via jules_get_stuck_sessions", async () => {
+    const res = await client.callTool("jules_get_stuck_sessions");
+    assert.ok(res.content && res.content.length > 0);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.ok(typeof parsed.count === "number");
+    assert.ok(Array.isArray(parsed.stuck));
+  });
+
   it("should monitor live pool events and detect sessions", async () => {
     const res = await client.callTool("jules_check_events", { limit_per_account: 5 });
     assert.ok(res.content && res.content.length >= 2);
@@ -178,12 +207,12 @@ describe("Jules MCP Server & Tool Registry v1.6.0", () => {
   it("should perform dry-run preflight check on real completed patch via jules_verify_patch", async () => {
     const res = await client.callTool("jules_verify_patch", {
       session_id: "13091084449805634763",
-      repo_path: "/root/projects/agent-brain",
+      repo_path: defaultRepoPath,
     });
     assert.ok(res.content && res.content.length >= 2);
     const parsed = JSON.parse(res.content[0].text);
     assert.equal(parsed.session_id, "13091084449805634763");
-    assert.equal(parsed.repo_path, "/root/projects/agent-brain");
+    assert.equal(parsed.repo_path, defaultRepoPath);
     assert.ok(typeof parsed.preflight_clean === "boolean");
     assert.ok(Array.isArray(parsed.files_touched));
     assert.ok(parsed.files_touched.includes("tests/test_health.py"));
@@ -209,7 +238,7 @@ describe("Jules MCP Server & Tool Registry v1.6.0", () => {
   it("should scan repo suggestions with indexed catalog and dry-run", async () => {
     const res = await client.callTool("jules_run_suggestions", {
       repo_name: "Agent-Brain",
-      repo_path: "/root/projects/agent-brain",
+      repo_path: defaultRepoPath,
       dry_run: true,
     });
     assert.ok(res.content && res.content.length >= 2);
@@ -227,7 +256,7 @@ describe("Jules MCP Server & Tool Registry v1.6.0", () => {
   it("should filter suggestions by specific indices", async () => {
     const res = await client.callTool("jules_run_suggestions", {
       repo_name: "Agent-Brain",
-      repo_path: "/root/projects/agent-brain",
+      repo_path: defaultRepoPath,
       dry_run: true,
       indices: [0, 2],
       force: true,

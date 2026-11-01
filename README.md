@@ -75,9 +75,8 @@ Universal Model Context Protocol (MCP) server for Google Jules Cloud Agent with 
 ```json
 {
   "accounts": [
-    { "name": "Primary", "email": "dev-account-1@example.com", "key": "[REDACTED]" },
-    { "name": "Secondary", "email": "dev-account-2@example.com", "key": "[REDACTED]" },
-    { "name": "Tertiary", "email": "dev-account-3@example.com", "key": "[REDACTED]" }
+    { "name": "Primary", "email": "dev-account-1@example.com", "key": "YOUR_JULES_API_KEY_1" },
+    { "name": "Secondary", "email": "dev-account-2@example.com", "key": "YOUR_JULES_API_KEY_2" }
   ]
 }
 ```

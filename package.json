@@ -1,7 +1,7 @@
 {
   "name": "jules-mcp",
-  "version": "1.6.0",
-  "description": "Universal MCP (Model Context Protocol) Server & CLI for Google Jules Cloud Agent - multi-account rotation, session management, 3-way consolidation, and automated PR integration",
+  "version": "1.7.0",
+  "description": "Universal Model Context Protocol (MCP) Server, Autonomous Scheduler & CLI for Google Jules Cloud Agent - multi-account rotation, background watchdog, dynamic webhook notifications, and automated PR integration across AI harnesses (Hermes, Claude Code, Cursor, Codex, Windsurf)",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -22,7 +22,7 @@
     "cursor",
     "hermes"
   ],
-  "author": "Yasser Bousrih <yasserbousrih@example.com>",
+  "author": "Yasser Bousrih <dev-account-1@example.com>",
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.6.0"

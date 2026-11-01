@@ -13,12 +13,18 @@ import * as os from "os";
 import * as crypto from "crypto";
 import { execSync, execFileSync } from "child_process";
 
-const CONFIG_PATH = process.env.JULES_CONFIG_PATH || path.join(process.env.HOME || "/root", ".config/jules/keys.json");
-const USAGE_PATH = process.env.JULES_USAGE_PATH || path.join(process.env.HOME || "/root", ".config/jules/usage.json");
-const QUEUE_PATH = process.env.JULES_QUEUE_PATH || path.join(process.env.HOME || "/root", ".config/jules/queue.json");
-const LOCKS_PATH = process.env.JULES_LOCKS_PATH || path.join(process.env.HOME || "/root", ".config/jules/locks.json");
-const REPO_ENVS_PATH = process.env.JULES_REPO_ENVS_PATH || path.join(process.env.HOME || "/root", ".config/jules/repo_envs.json");
-const ORIGINS_PATH = process.env.JULES_ORIGINS_PATH || path.join(process.env.HOME || "/root", ".config/jules/origins.json");
+const JULES_DIR = process.env.JULES_CONFIG_DIR || path.join(os.homedir(), ".config", "jules");
+const CONFIG_PATH = process.env.JULES_CONFIG_PATH || path.join(JULES_DIR, "keys.json");
+const USAGE_PATH = process.env.JULES_USAGE_PATH || path.join(JULES_DIR, "usage.json");
+const QUEUE_PATH = process.env.JULES_QUEUE_PATH || path.join(JULES_DIR, "queue.json");
+const LOCKS_PATH = process.env.JULES_LOCKS_PATH || path.join(JULES_DIR, "locks.json");
+const REPO_ENVS_PATH = process.env.JULES_REPO_ENVS_PATH || path.join(JULES_DIR, "repo_envs.json");
+const ORIGINS_PATH = process.env.JULES_ORIGINS_PATH || path.join(JULES_DIR, "origins.json");
+const ALIASES_PATH = process.env.JULES_ALIASES_PATH || path.join(JULES_DIR, "aliases.json");
+const INVARIANTS_PATH = process.env.JULES_INVARIANTS_PATH || path.join(JULES_DIR, "invariants.json");
+const DEPRECATED_PATH = process.env.JULES_DEPRECATED_PATH || path.join(JULES_DIR, "deprecated_repos.json");
+const EVENTS_PATH = process.env.JULES_EVENTS_PATH || path.join(JULES_DIR, "events.json");
+const WATCHDOG_STATE_PATH = process.env.JULES_WATCHDOG_STATE_PATH || path.join(JULES_DIR, "watchdog_state.json");
 const API_BASE = "https://jules.googleapis.com/v1alpha";
 
 interface Account {
@@ -86,7 +92,7 @@ interface LocksLedger {
 }
 
 // --- Suggestion engine ledger (24h dedup window) ---
-const SUGGESTIONS_PATH = process.env.JULES_SUGGESTIONS_PATH || path.join(process.env.HOME || "/root", ".config/jules/suggestions_ledger.json");
+const SUGGESTIONS_PATH = process.env.JULES_SUGGESTIONS_PATH || path.join(JULES_DIR, "suggestions_ledger.json");
 
 interface SuggestionRecord {
   fingerprint: string;
@@ -509,23 +515,30 @@ function reconcileSemanticConflicts(content: string, filePath: string): { reconc
 }
 
 
-// Deprecated or decommissioned repos that should NEVER be dispatched to Jules
-const DEPRECATED_REPOS: Record<string, string> = {
-  "email-assistant": "Deprecated microservice. Replaced by unified email-channel & agent-brain.",
-  "omnichat-backend": "Deprecated standalone repo. Replaced by chat-channel & agent-brain.",
-  "chat-gateway": "Deprecated standalone repo. Unified into chat-channel.",
-};
+// Deprecated or decommissioned repos (customizable dynamically via ~/.config/jules/deprecated_repos.json)
+const DEPRECATED_REPOS: Record<string, string> = {};
 
-// Architecture invariants injected into prompts based on repository
-const ARCHITECTURE_INVARIANTS: Record<string, string> = {
-  "agent-brain": "ARCHITECTURAL INVARIANT: Agent-Brain is the shared multi-tenant AI reasoning engine for both Enterprise and ExampleApp. Do NOT hardcode tenant IDs or break cross-capability channel contracts.",
-  "backend-service": "ARCHITECTURAL INVARIANT: Enterprise-backend is a multi-tenant FastAPI service. Postgres is local (127.0.0.1). Do NOT change database connection parameters or alter multi-tenant auth middleware.",
-  "frontend-service": "ARCHITECTURAL INVARIANT: Enterprise-frontend is a Next.js 16 app deployed on Vercel. Ensure strict TypeScript types (tsc --noEmit must pass with 0 errors).",
-  "example-app": "ARCHITECTURAL INVARIANT: ExampleApp is a Next.js 15 fullstack application (Server Actions + raw Postgres queries). Do NOT break multi-tenant client portal routing.",
-  "voice-channel": "ARCHITECTURAL INVARIANT: Real-time telephony microservice (Twilio Media Streams -> Deepgram STT -> ElevenLabs TTS). Maintain low-latency async streams.",
-  "chat-channel": "ARCHITECTURAL INVARIANT: Unified omni-channel gateway (WhatsApp, SMS, Socket.io) subscribing to Agent-Brain events.",
-  "email-channel": "ARCHITECTURAL INVARIANT: Autonomous email gateway subscribing to Agent-Brain events.",
-};
+// Architecture invariants injected into prompts (customizable dynamically via ~/.config/jules/invariants.json)
+const ARCHITECTURE_INVARIANTS: Record<string, string> = {};
+function getDeprecatedRepos(): Record<string, string> {
+  let custom: Record<string, string> = {};
+  try {
+    if (fs.existsSync(DEPRECATED_PATH)) {
+      custom = JSON.parse(fs.readFileSync(DEPRECATED_PATH, "utf-8"));
+    }
+  } catch {}
+  return { ...DEPRECATED_REPOS, ...custom };
+}
+
+function getArchitectureInvariants(): Record<string, string> {
+  let custom: Record<string, string> = {};
+  try {
+    if (fs.existsSync(INVARIANTS_PATH)) {
+      custom = JSON.parse(fs.readFileSync(INVARIANTS_PATH, "utf-8"));
+    }
+  } catch {}
+  return { ...ARCHITECTURE_INVARIANTS, ...custom };
+}
 
 interface ChoreRecipe {
   name: string;
@@ -758,19 +771,89 @@ async function requestWithFallback(
   throw lastError || new Error(`Operation failed across all ${accounts.length} accounts.`);
 }
 
+// Built-in repository aliases (users configure custom aliases in ~/.config/jules/aliases.json)
+const REPO_ALIASES: Record<string, string> = {};
+
+function loadUserAliases(): Record<string, string> {
+  try {
+    if (fs.existsSync(ALIASES_PATH)) {
+      return JSON.parse(fs.readFileSync(ALIASES_PATH, "utf-8"));
+    }
+  } catch {}
+  return {};
+}
+
+function getDefaultOwner(): string {
+  if (process.env.JULES_GITHUB_OWNER) {
+    return process.env.JULES_GITHUB_OWNER.trim();
+  }
+  try {
+    const ghUser = execSync("gh api user --jq .login 2>/dev/null", { encoding: "utf-8" }).trim();
+    if (ghUser && !ghUser.includes(" ")) return ghUser;
+  } catch {}
+  try {
+    const remoteUrl = execSync("git config --get remote.origin.url 2>/dev/null", { encoding: "utf-8" }).trim();
+    const match = remoteUrl.match(/(?:github\.com[/:])([^/]+)\//);
+    if (match && match[1] && !match[1].includes(" ")) return match[1];
+  } catch {}
+  try {
+    const gitUser = execSync("git config github.user 2>/dev/null", { encoding: "utf-8" }).trim();
+    if (gitUser && !gitUser.includes(" ")) return gitUser;
+  } catch {}
+  return "";
+}
+
+function cleanRepoName(sourceStr?: string): string {
+  if (!sourceStr) return "Unknown Repo";
+  return sourceStr.replace(/^sources\/github\/[^/]+\//, "").replace(/^sources\//, "");
+}
+
+function resolveCanonicalSource(input: string): string {
+  if (!input) return "";
+  const userAliases = loadUserAliases();
+  
+  if (input.startsWith("sources/")) {
+    const parts = input.split("/");
+    const repo = parts[parts.length - 1];
+    const canonical = userAliases[repo.toLowerCase()] || REPO_ALIASES[repo.toLowerCase()] || repo;
+    if (input.startsWith("sources/github/") && parts.length >= 4) {
+      const owner = parts[2];
+      return `sources/github/${owner}/${canonical}`;
+    }
+    return `sources/github/${getDefaultOwner()}/${canonical}`;
+  }
+
+  // Handle owner/repo format
+  if (input.includes("/")) {
+    const parts = input.replace(/^github\//, "").split("/");
+    if (parts.length === 2) {
+      const [owner, repo] = parts;
+      const canonical = userAliases[repo.toLowerCase()] || REPO_ALIASES[repo.toLowerCase()] || repo;
+      return `sources/github/${owner}/${canonical}`;
+    }
+  }
+
+  const raw = input.replace(/^sources\/github\//, "").replace(/^[^/]+\//, "");
+  const canonical = userAliases[raw.toLowerCase()] || REPO_ALIASES[raw.toLowerCase()] || raw;
+  return `sources/github/${getDefaultOwner()}/${canonical}`;
+}
+
 // Select account with lowest active load & guaranteed rolling 24h quota
 async function getLeastLoadedAccount(): Promise<Account> {
   const accounts = getAccounts();
   if (accounts.length === 1) return accounts[0];
 
   const quotaStatus = getQuotaStatus();
+  const TERMINAL_STATES = ["COMPLETED", "FAILED", "CANCELLED", "STATE_UNSPECIFIED"];
   const loads = await Promise.all(
     accounts.map(async (acc) => {
       const accKey = acc.name || acc.email || "Account";
       const q = quotaStatus[accKey] || { usedLast24h: 0, remaining: 15 };
       try {
         const res = await request("sessions?pageSize=20", acc.key);
-        const inFlight = (res.sessions || []).filter((s: any) => s.state === "IN_PROGRESS").length;
+        const inFlight = (res.sessions || []).filter(
+          (s: any) => !TERMINAL_STATES.includes(s.state)
+        ).length;
         return { account: acc, inFlight, used24h: q.usedLast24h, remaining: q.remaining };
       } catch {
         return { account: acc, inFlight: 99, used24h: q.usedLast24h, remaining: q.remaining };
@@ -778,7 +861,11 @@ async function getLeastLoadedAccount(): Promise<Account> {
     })
   );
 
+  // Priority: accounts under 5 concurrent > quota remaining > lowest inFlight > lowest used24h
   loads.sort((a, b) => {
+    const aUnderCap = a.inFlight < 5 ? 0 : 1;
+    const bUnderCap = b.inFlight < 5 ? 0 : 1;
+    if (aUnderCap !== bUnderCap) return aUnderCap - bUnderCap;
     if (a.remaining > 0 && b.remaining === 0) return -1;
     if (a.remaining === 0 && b.remaining > 0) return 1;
     if (a.inFlight !== b.inFlight) return a.inFlight - b.inFlight;
@@ -792,7 +879,7 @@ async function getLeastLoadedAccount(): Promise<Account> {
 function decoratePrompt(rawPrompt: string, repoIdentifier: string, customEnv?: Record<string, string>): string {
   const cleanRepo = repoIdentifier.toLowerCase().replace(/^sources\/github\/[^/]+\//, "");
   let invariant = "";
-  for (const [key, val] of Object.entries(ARCHITECTURE_INVARIANTS)) {
+  for (const [key, val] of Object.entries(getArchitectureInvariants())) {
     if (cleanRepo.includes(key)) {
       invariant = `\n${val}\n`;
       break;
@@ -821,7 +908,7 @@ Never commit or stage the .env file or credentials into git commits, patches, or
   let verificationDirective = "";
   if (cleanRepo.includes("backend") || cleanRepo.includes("brain") || cleanRepo.includes("channel") || cleanRepo.includes("trader")) {
     verificationDirective = `\nCRITICAL CONTAINER TEST RUNNER:\nIn your container sandbox, execute 'pytest' or 'python3 -m unittest' and verify 0 test failures before finalizing output.\n`;
-  } else if (cleanRepo.includes("frontend") || cleanRepo.includes("example-app") || cleanRepo.includes("mcp") || cleanRepo.includes("frontdesk")) {
+  } else if (cleanRepo.includes("frontend") || cleanRepo.includes("ui") || cleanRepo.includes("web") || cleanRepo.includes("client") || cleanRepo.includes("mcp")) {
     verificationDirective = `\nCRITICAL CONTAINER TEST RUNNER:\nIn your container sandbox, execute 'npm run build' (or 'npx tsc --noEmit') and project test suites to verify 0 type or test errors before finalizing output.\n`;
   }
 
@@ -837,14 +924,324 @@ CRITICAL AUTONOMOUS EXECUTION DIRECTIVES:
   return `${rawPrompt.trim()}${invariant}${envDirective}${verificationDirective}\n${antiPauseGuard}`.trim();
 }
 
+
+// --- Autonomous Watchdog & Event Notification Engine ---
+
+export interface JulesEvent {
+  id: string;
+  timestamp: number;
+  type: "session_stuck" | "session_unblocked" | "pr_created" | "task_completed" | "task_failed" | "queue_drained";
+  session_id?: string;
+  repo?: string;
+  title?: string;
+  account?: string;
+  question?: string;
+  pr_url?: string;
+  error?: string;
+  details?: any;
+}
+
+interface WatchdogState {
+  notified_stuck: Record<string, string>;
+  notified_prs: string[];
+  notified_failed: string[];
+}
+
+function loadWatchdogState(): WatchdogState {
+  try {
+    if (fs.existsSync(WATCHDOG_STATE_PATH)) {
+      const data = JSON.parse(fs.readFileSync(WATCHDOG_STATE_PATH, "utf-8"));
+      return {
+        notified_stuck: data.notified_stuck || {},
+        notified_prs: Array.isArray(data.notified_prs) ? data.notified_prs : [],
+        notified_failed: Array.isArray(data.notified_failed) ? data.notified_failed : [],
+      };
+    }
+  } catch {}
+  return { notified_stuck: {}, notified_prs: [], notified_failed: [] };
+}
+
+function saveWatchdogState(state: WatchdogState) {
+  try {
+    const dir = path.dirname(WATCHDOG_STATE_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(WATCHDOG_STATE_PATH, JSON.stringify(state, null, 2), "utf-8");
+  } catch {}
+}
+
+async function dispatchWebhookEvent(event: JulesEvent): Promise<void> {
+  const webhookUrl = process.env.JULES_WEBHOOK_URL;
+  if (!webhookUrl) return;
+
+  try {
+    const parsed = new URL(webhookUrl);
+    const body = JSON.stringify(event);
+    const options: https.RequestOptions = {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+        "User-Agent": "Jules-MCP-Autonomous-Watchdog/1.7.0",
+      },
+    };
+
+    if (parsed.protocol === "https:") {
+      const req = https.request(parsed, options);
+      req.on("error", () => {});
+      req.write(body);
+      req.end();
+    } else if (parsed.protocol === "http:") {
+      const http = await import("http");
+      const req = http.request(parsed, options);
+      req.on("error", () => {});
+      req.write(body);
+      req.end();
+    }
+  } catch {}
+}
+
+function appendEvent(event: Omit<JulesEvent, "id" | "timestamp">): JulesEvent {
+  const fullEvent: JulesEvent = {
+    id: "evt_" + Date.now() + "_" + Math.random().toString(36).substring(2, 7),
+    timestamp: Date.now(),
+    ...event,
+  };
+
+  try {
+    let events: JulesEvent[] = [];
+    if (fs.existsSync(EVENTS_PATH)) {
+      events = JSON.parse(fs.readFileSync(EVENTS_PATH, "utf-8"));
+    }
+    events.unshift(fullEvent);
+    if (events.length > 100) events = events.slice(0, 100);
+    const dir = path.dirname(EVENTS_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(EVENTS_PATH, JSON.stringify(events, null, 2), "utf-8");
+  } catch {}
+
+  dispatchWebhookEvent(fullEvent).catch(() => {});
+  return fullEvent;
+}
+
+export async function runWatchdogCycle(): Promise<{ stuckCount: number; prCount: number; drainedCount: number; alerts: string[] }> {
+  const accounts = getAccounts();
+  const alerts: string[] = [];
+  if (accounts.length === 0) return { stuckCount: 0, prCount: 0, drainedCount: 0, alerts };
+
+  const state = loadWatchdogState();
+  let stuckCount = 0;
+  let prCount = 0;
+  let availableSlots = 0;
+
+  const TERMINAL = ["COMPLETED", "FAILED", "CANCELLED", "STATE_UNSPECIFIED"];
+  const autoUnblock = process.env.JULES_AUTO_UNBLOCK === "true";
+
+  for (const acc of accounts) {
+    const accName = acc.name || acc.email || "Account";
+    try {
+      const res = await request("sessions?pageSize=20", acc.key);
+      const sessions = res.sessions || [];
+      let inFlight = 0;
+
+      for (const s of sessions) {
+        const st = s.state || "STATE_UNSPECIFIED";
+        const sid = s.id || s.name?.replace("sessions/", "");
+        const title = s.title || "Untitled Task";
+        const repo = cleanRepoName(s.sourceContext?.source);
+
+        if (!TERMINAL.includes(st)) {
+          inFlight++;
+        }
+
+        // 1. Stuck Sessions (AWAITING_USER_FEEDBACK)
+        if (st === "AWAITING_USER_FEEDBACK") {
+          stuckCount++;
+          let question = "";
+          try {
+            const actRes = await request(`sessions/${sid}/activities?pageSize=50`, acc.key);
+            const acts = actRes.activities || [];
+            for (let i = acts.length - 1; i >= 0; i--) {
+              const msg = acts[i]?.agentMessaged?.agentMessage;
+              if (msg) {
+                const raw = typeof msg === "string" ? msg : (msg.text || JSON.stringify(msg));
+                question = raw.replace(/\s+/g, " ").trim();
+                break;
+              }
+            }
+          } catch {}
+
+          const prevQ = state.notified_stuck[sid];
+          if (prevQ !== question) {
+            state.notified_stuck[sid] = question;
+            appendEvent({
+              type: "session_stuck",
+              session_id: sid,
+              repo,
+              title,
+              account: accName,
+              question,
+            });
+
+            const alertMsg = `🚨 [Jules Watchdog] Task Stuck: [${repo}] "${title}" (Session ${sid})\nQuestion: ${question || "(no message text)"}\nAction: jules_reply_feedback(session_id='${sid}', message='<answer>')`;
+            alerts.push(alertMsg);
+
+            try {
+              server.sendLoggingMessage({
+                level: "warning",
+                data: alertMsg,
+                logger: "jules-watchdog",
+              });
+            } catch {}
+
+            if (autoUnblock) {
+              try {
+                const directive = "Proceed autonomously using standard project conventions and stdlib approach. Avoid adding new dependencies, run test verifications, and submit the patch.";
+                await request(`sessions/${sid}:sendMessage`, acc.key, { method: "POST" }, { prompt: directive });
+                appendEvent({
+                  type: "session_unblocked",
+                  session_id: sid,
+                  repo,
+                  title,
+                  account: accName,
+                  details: { auto_nudge: true, directive },
+                });
+                try {
+                  server.sendLoggingMessage({
+                    level: "info",
+                    data: `⚡ [Jules Watchdog] Auto-unblocked session ${sid} with standard anti-pause directive.`,
+                    logger: "jules-watchdog",
+                  });
+                } catch {}
+              } catch {}
+            }
+          }
+        } else if (state.notified_stuck[sid] && st !== "AWAITING_USER_FEEDBACK") {
+          delete state.notified_stuck[sid];
+        }
+
+        // 2. Completed Sessions with PRs
+        if (st === "COMPLETED") {
+          for (const out of s.outputs || []) {
+            const pr = out.pullRequest;
+            if (pr?.url && !state.notified_prs.includes(pr.url)) {
+              state.notified_prs.push(pr.url);
+              prCount++;
+              appendEvent({
+                type: "pr_created",
+                session_id: sid,
+                repo,
+                title,
+                account: accName,
+                pr_url: pr.url,
+              });
+
+              const prMsg = `🎉 [Jules Watchdog] PR Created on ${repo}: ${pr.title || title}\nURL: ${pr.url}\nMerge via: jules_merge_pr(pr_url_or_number='${pr.url}')`;
+              alerts.push(prMsg);
+
+              try {
+                server.sendLoggingMessage({
+                  level: "info",
+                  data: prMsg,
+                  logger: "jules-watchdog",
+                });
+              } catch {}
+            }
+          }
+        }
+
+        // 3. Failed Sessions
+        if (st === "FAILED" && !state.notified_failed.includes(sid)) {
+          state.notified_failed.push(sid);
+          appendEvent({
+            type: "task_failed",
+            session_id: sid,
+            repo,
+            title,
+            account: accName,
+            error: s.failureReason || "Session failed in cloud sandbox",
+          });
+
+          const failMsg = `❌ [Jules Watchdog] Task Failed on ${repo}: "${title}" (Session ${sid})\nReason: ${s.failureReason || "Unknown"}`;
+          alerts.push(failMsg);
+
+          try {
+            server.sendLoggingMessage({
+              level: "error",
+              data: failMsg,
+              logger: "jules-watchdog",
+            });
+          } catch {}
+        }
+      }
+
+      availableSlots += Math.max(0, 5 - inFlight);
+    } catch {}
+  }
+
+  // 4. Auto-Drain Queue if free slots exist
+  let drainedCount = 0;
+  const queue = loadTaskQueue();
+  if (queue.tasks.length > 0 && availableSlots > 0) {
+    try {
+      for (const task of [...queue.tasks]) {
+        if (drainedCount >= availableSlots) break;
+        const bestAccount = await getLeastLoadedAccount();
+        if (!bestAccount) break;
+
+        const sourceResource = resolveCanonicalSource(task.source);
+        const payload: any = {
+          prompt: decoratePrompt(task.prompt, task.source),
+          sourceContext: {
+            source: sourceResource,
+            githubRepoContext: { startingBranch: "main" },
+          },
+          automationMode: "AUTO_CREATE_PR",
+        };
+        if (task.title) payload.title = task.title;
+
+        try {
+          const createRes = await request("sessions", bestAccount.key, { method: "POST" }, payload);
+          dequeueTask(task.id);
+          drainedCount++;
+          appendEvent({
+            type: "queue_drained",
+            session_id: createRes.id || createRes.name?.replace("sessions/", ""),
+            repo: task.source,
+            title: task.title || task.prompt.slice(0, 40),
+            account: bestAccount.name || bestAccount.email,
+          });
+        } catch {}
+      }
+    } catch {}
+  }
+
+  state.notified_prs = (state.notified_prs || []).slice(-100);
+  state.notified_failed = (state.notified_failed || []).slice(-100);
+  saveWatchdogState(state);
+
+  return { stuckCount, prCount, drainedCount, alerts };
+}
+
+function startAutonomousWatchdog() {
+  const intervalSec = Number(process.env.JULES_WATCHDOG_INTERVAL_SECONDS) || 60;
+  if (intervalSec <= 0) return;
+
+  setInterval(async () => {
+    try {
+      await runWatchdogCycle();
+    } catch {}
+  }, intervalSec * 1000);
+}
+
 const server = new Server(
   {
     name: "jules-mcp",
-    version: "1.6.0",
+    version: "1.7.0",
   },
   {
     capabilities: {
       tools: {},
+      logging: {},
     },
   }
 );
@@ -852,6 +1249,42 @@ const server = new Server(
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
+      {
+        name: "jules_poll_watchdog",
+        description:
+          "Trigger an immediate autonomous watchdog cycle across all Jules accounts: detects stuck questions, logs real-time events, unblocks if configured, notifies newly opened PRs, and auto-drains queued tasks into newly available slots.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "jules_get_events",
+        description:
+          "Retrieve rolling cross-harness background event ledger (stuck sessions, auto-unblocks, PR creations, failures) generated by the autonomous Jules watchdog.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            limit: {
+              type: "number",
+              description: "Max number of recent events to return (default: 20)",
+            },
+            type: {
+              type: "string",
+              description: "Optional filter by event type (e.g. 'session_stuck', 'pr_created', 'task_failed', 'queue_drained')",
+            },
+          },
+        },
+      },
+      {
+        name: "jules_get_stuck_sessions",
+        description:
+          "Scan all Google Jules accounts for sessions currently stuck in AWAITING_USER_FEEDBACK, extracting the exact question Jules asked, the target repository, and the ready-to-run unblock action.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
       {
         name: "jules_check_events",
         description: "Real-time event monitor across all Google accounts in the pool: detects sessions that are stuck (asking questions), awaiting plan approval, completed (with PR/patch details), or failed. The primary harness tool for 'Is Jules done? Is Jules stuck?'.",
@@ -996,7 +1429,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             repo_path: {
               type: "string",
-              description: "Absolute local path of the repository to scan (e.g. '/root/projects/agent-brain').",
+              description: "Absolute local path of the repository to scan (e.g. '/absolute/path/to/repo').",
             },
             categories: {
               type: "array",
@@ -1036,7 +1469,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             repo_path: {
               type: "string",
-              description: "Absolute local repository path on this machine (e.g. '/root/projects/agent-brain').",
+              description: "Absolute local repository path on this machine (e.g. '/absolute/path/to/repo').",
             },
           },
           required: ["session_id", "repo_path"],
@@ -1050,7 +1483,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             repo_path: {
               type: "string",
-              description: "Absolute local repository path (e.g. '/root/projects/agent-brain').",
+              description: "Absolute local repository path (e.g. '/absolute/path/to/repo').",
             },
             session_ids: {
               type: "array",
@@ -1159,7 +1592,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             repo_path: {
               type: "string",
-              description: "Absolute local repository path on this machine (e.g. '/root/projects/agent-brain').",
+              description: "Absolute local repository path on this machine (e.g. '/absolute/path/to/repo').",
             },
             branch_name: {
               type: "string",
@@ -1185,11 +1618,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             pr_url_or_number: {
               type: "string",
-              description: "GitHub PR URL (e.g. 'https://github.com/yasserbousrih/Agent-Brain/pull/1') or PR number.",
+              description: "GitHub PR URL (e.g. 'https://github.com/owner/repo/pull/1') or PR number.",
             },
             repo: {
               type: "string",
-              description: "Repository name (e.g. 'yasserbousrih/Agent-Brain'). Required if only PR number is passed.",
+              description: "Repository name (e.g. 'owner/repo'). Required if only PR number is passed.",
             },
           },
           required: ["pr_url_or_number"],
@@ -1241,7 +1674,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             source: {
               type: "string",
-              description: "Source resource name (e.g. 'sources/github/yasserbousrih/Basria-backend') or repo name.",
+              description: "Source resource name (e.g. 'sources/github/owner/repo' or 'repo-name').",
             },
           },
           required: ["source"],
@@ -1255,7 +1688,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             source: {
               type: "string",
-              description: "GitHub repository identifier or short name (e.g. 'Basria-backend' or 'sources/github/yasserbousrih/Basria-backend')",
+              description: "GitHub repository identifier or short name (e.g. 'my-repo' or 'sources/github/owner/my-repo')",
             },
             prompt: {
               type: "string",
@@ -1537,7 +1970,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             repo_path: {
               type: "string",
-              description: "Optional local repo path to test and apply against (e.g. '/root/projects/agent-brain').",
+              description: "Optional local repo path to test and apply against (e.g. '/absolute/path/to/repo').",
             },
             test_command: {
               type: "string",
@@ -1596,7 +2029,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             repo: {
               type: "string",
-              description: "Repository identifier or name (e.g. 'Agent-Brain', 'example-app', 'Basria-backend').",
+              description: "Repository identifier or name (e.g. 'my-repo', 'backend-service').",
             },
             env_vars: {
               type: "object",
@@ -1655,6 +2088,155 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
 
   try {
     // ----------------------------------------------------
+    // TOOL: jules_poll_watchdog
+    // ----------------------------------------------------
+    if (name === "jules_poll_watchdog") {
+      const cycle = await runWatchdogCycle();
+      let summary = `# 🐶 Jules Autonomous Watchdog Cycle Complete\n\n`;
+      summary += `• **Stuck Detected:** ${cycle.stuckCount}\n`;
+      summary += `• **New PRs Detected:** ${cycle.prCount}\n`;
+      summary += `• **Queue Tasks Auto-Drained:** ${cycle.drainedCount}\n\n`;
+
+      if (cycle.alerts.length > 0) {
+        summary += `### 🔔 Active Alerts\n` + cycle.alerts.map((a) => `• ${a.replace(/\n/g, "\n  ")}`).join("\n\n") + "\n";
+      } else {
+        summary += `All pool sessions running optimally. Zero unhandled alerts.\n`;
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(cycle, null, 2),
+          },
+          {
+            type: "text",
+            text: summary,
+          },
+        ],
+      };
+    }
+
+    // ----------------------------------------------------
+    // TOOL: jules_get_events
+    // ----------------------------------------------------
+    if (name === "jules_get_events") {
+      const limit = Number(args.limit) || 20;
+      const filterType = args.type as string | undefined;
+
+      let events: JulesEvent[] = [];
+      try {
+        if (fs.existsSync(EVENTS_PATH)) {
+          events = JSON.parse(fs.readFileSync(EVENTS_PATH, "utf-8"));
+        }
+      } catch {}
+
+      if (filterType) {
+        events = events.filter((e) => e.type === filterType);
+      }
+      events = events.slice(0, limit);
+
+      let summary = `# 📋 Jules Cross-Harness Event Ledger (${events.length})\n\n`;
+      if (events.length === 0) {
+        summary += `No recent background events logged.\n`;
+      } else {
+        for (const e of events) {
+          const dateStr = new Date(e.timestamp).toISOString();
+          summary += `• **[${e.type.toUpperCase()}]** \`${dateStr}\` | Repo: \`${e.repo || "N/A"}\`\n`;
+          if (e.title) summary += `  **Title:** ${e.title}\n`;
+          if (e.question) summary += `  **Question:** *${e.question}*\n`;
+          if (e.pr_url) summary += `  **PR:** ${e.pr_url}\n`;
+          if (e.error) summary += `  **Error:** ${e.error}\n`;
+          summary += `\n`;
+        }
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ count: events.length, events }, null, 2),
+          },
+          {
+            type: "text",
+            text: summary,
+          },
+        ],
+      };
+    }
+
+    // ----------------------------------------------------
+    // TOOL: jules_get_stuck_sessions
+    // ----------------------------------------------------
+    if (name === "jules_get_stuck_sessions") {
+      const accounts = getAccounts();
+      const stuck: any[] = [];
+      await Promise.all(
+        accounts.map(async (acc) => {
+          const accName = acc.name || acc.email || "Account";
+          try {
+            const res = await request("sessions?pageSize=50", acc.key);
+            const stuckSessions = (res.sessions || []).filter((s: any) => s.state === "AWAITING_USER_FEEDBACK");
+            await Promise.all(
+              stuckSessions.map(async (s: any) => {
+                const sid = s.id || s.name?.replace("sessions/", "");
+                let question: string | null = null;
+                try {
+                  const actRes = await request(`sessions/${sid}/activities?pageSize=50`, acc.key);
+                  const activities: any[] = actRes.activities || [];
+                  for (let i = activities.length - 1; i >= 0; i--) {
+                    const agentMsg = activities[i]?.agentMessaged?.agentMessage;
+                    if (agentMsg) {
+                      const raw = typeof agentMsg === "string" ? agentMsg : (agentMsg.text || agentMsg.content || JSON.stringify(agentMsg));
+                      question = raw.replace(/\s+/g, " ").trim();
+                      break;
+                    }
+                  }
+                } catch {}
+                stuck.push({
+                  session_id: sid,
+                  repo: cleanRepoName(s.sourceContext?.source),
+                  title: s.title || "Untitled Task",
+                  account: accName,
+                  web_url: s.url || `https://jules.google.com/session/${sid}`,
+                  question: question || undefined,
+                  action: `jules_reply_feedback(session_id='${sid}', message='<answer>')`,
+                });
+              })
+            );
+          } catch {}
+        })
+      );
+
+      let summary = `# 🚨 Jules Stuck Sessions (${stuck.length})\n\n`;
+      if (stuck.length === 0) {
+        summary += `All sessions running autonomously. Zero sessions awaiting user feedback.\n`;
+      } else {
+        for (const item of stuck) {
+          summary += `• **Repo:** \`${item.repo}\` | **ID:** \`${item.session_id}\` [${item.account}]\n`;
+          summary += `  **Title:** ${item.title}\n`;
+          if (item.question) {
+            summary += `  **Jules Question:** *${item.question}*\n`;
+          }
+          summary += `  **Action:** \`${item.action}\`\n\n`;
+        }
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ count: stuck.length, stuck }, null, 2),
+          },
+          {
+            type: "text",
+            text: summary,
+          },
+        ],
+      };
+    }
+
+    // ----------------------------------------------------
     // TOOL 1: jules_check_events
     // ----------------------------------------------------
     if (name === "jules_check_events") {
@@ -1680,16 +2262,32 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
             const sid = s.id || s.name?.replace("sessions/", "");
             const state = s.state || "STATE_UNSPECIFIED";
             const title = s.title || "Untitled Task";
-            const source = s.sourceContext?.source?.replace("sources/github/yasserbousrih/", "") || "Unknown Repo";
+            const source = cleanRepoName(s.sourceContext?.source);
             const webUrl = s.url || `https://jules.google.com/session/${sid}`;
 
             if (state === "AWAITING_USER_FEEDBACK") {
+              // Fetch recent activities to extract Jules's question
+              let question: string | null = null;
+              try {
+                const actRes = await request(`sessions/${sid}/activities?pageSize=50`, acc.key);
+                const activities: any[] = actRes.activities || [];
+                // Find the last agent message activity
+                for (let i = activities.length - 1; i >= 0; i--) {
+                  const agentMsg = activities[i]?.agentMessaged?.agentMessage;
+                  if (agentMsg) {
+                    const raw = typeof agentMsg === "string" ? agentMsg : (agentMsg.text || agentMsg.content || JSON.stringify(agentMsg));
+                    question = raw.replace(/\s+/g, " ").trim().slice(0, 400);
+                    break;
+                  }
+                }
+              } catch {}
               events.stuck.push({
                 session_id: sid,
                 repo: source,
                 title,
                 account: accName,
                 web_url: webUrl,
+                question,
                 action: `jules_reply_feedback(session_id='${sid}', message='<answer>')`,
               });
             } else if (state === "AWAITING_PLAN_APPROVAL") {
@@ -1723,6 +2321,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
                 repo: source,
                 title,
                 account: accName,
+                failure_reason: s.failureReason || null,
                 web_url: webUrl,
               });
             } else if (state === "IN_PROGRESS") {
@@ -1740,17 +2339,24 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
 
       await Promise.all(accountPromises);
 
+      // Cap completed to 5 most recent for token efficiency
+      events.completed = events.completed.slice(0, 5);
+
       let summaryMd = `# Google Jules Pool Live Events\n\n`;
       summaryMd += `• **Stuck (Needs Feedback):** ${events.stuck.length}\n`;
       summaryMd += `• **Needs Plan Approval:** ${events.needs_plan_approval.length}\n`;
       summaryMd += `• **In Progress:** ${events.in_progress.length}\n`;
-      summaryMd += `• **Completed:** ${events.completed.length}\n`;
+      summaryMd += `• **Completed:** ${events.completed.length} (showing up to 5 most recent)\n`;
       summaryMd += `• **Failed:** ${events.failed.length}\n\n`;
 
       if (events.stuck.length > 0) {
         summaryMd += `## 🚨 Stuck Tasks (Needs Feedback)\n`;
         for (const st of events.stuck) {
-          summaryMd += `- **Repo:** \`${st.repo}\` | **ID:** \`${st.session_id}\`\n  **Title:** ${st.title}\n  **Action:** \`${st.action}\`\n\n`;
+          summaryMd += `- **Repo:** \`${st.repo}\` | **ID:** \`${st.session_id}\`\n  **Title:** ${st.title}\n`;
+          if (st.question) {
+            summaryMd += `  **Question from Jules:** *${st.question}*\n`;
+          }
+          summaryMd += `  **Action:** \`${st.action}\`\n\n`;
         }
       }
 
@@ -1773,7 +2379,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
         content: [
           {
             type: "text",
-            text: JSON.stringify(events, null, 2),
+            text: JSON.stringify({ stuck: events.stuck, needs_plan_approval: events.needs_plan_approval, in_progress: events.in_progress, completed: events.completed, failed: events.failed }, null, 2),
           },
           {
             type: "text",
@@ -1927,13 +2533,13 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
 
       // Check Deprecated Repos
       const cleanRepo = sourceInput.toLowerCase().replace(/^sources\/github\/[^\/]+\//, "");
-      if (DEPRECATED_REPOS[cleanRepo]) {
-        throw new Error(`Repository '${cleanRepo}' is deprecated. Reason: ${DEPRECATED_REPOS[cleanRepo]}`);
+      if (getDeprecatedRepos()[cleanRepo]) {
+        throw new Error(`Repository '${cleanRepo}' is deprecated. Reason: ${getDeprecatedRepos()[cleanRepo]}`);
       }
 
       const sourceResource = sourceInput.startsWith("sources/")
         ? sourceInput
-        : `sources/github/yasserbousrih/${sourceInput.replace(/^sources\/github\//, "")}`;
+        : resolveCanonicalSource(sourceInput.replace(/^sources\/github\//, ""));
 
       const decoratedPrompt = decoratePrompt(prompt, sourceInput);
 
@@ -2042,13 +2648,13 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
 
       // Check Deprecated Repos
       const cleanRepo = sourceInput.toLowerCase().replace(/^sources\/github\/[^\/]+\//, "");
-      if (DEPRECATED_REPOS[cleanRepo]) {
-        throw new Error(`Repository '${cleanRepo}' is deprecated. Reason: ${DEPRECATED_REPOS[cleanRepo]}`);
+      if (getDeprecatedRepos()[cleanRepo]) {
+        throw new Error(`Repository '${cleanRepo}' is deprecated. Reason: ${getDeprecatedRepos()[cleanRepo]}`);
       }
 
       const sourceResource = sourceInput.startsWith("sources/")
         ? sourceInput
-        : `sources/github/yasserbousrih/${sourceInput.replace(/^sources\/github\//, "")}`;
+        : resolveCanonicalSource(sourceInput.replace(/^sources\/github\//, ""));
 
       const decoratedPrompt = decoratePrompt(generatedPrompt, sourceInput);
 
@@ -2156,8 +2762,8 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
       }
 
       const cleanRepo = repoName.toLowerCase().replace(/^sources\/github\/[^/]+\//, "");
-      if (DEPRECATED_REPOS[cleanRepo]) {
-        throw new Error(`Repository '${cleanRepo}' is deprecated. Reason: ${DEPRECATED_REPOS[cleanRepo]}`);
+      if (getDeprecatedRepos()[cleanRepo]) {
+        throw new Error(`Repository '${cleanRepo}' is deprecated. Reason: ${getDeprecatedRepos()[cleanRepo]}`);
       }
 
       // 1. Scan local repo for suggestions
@@ -2271,7 +2877,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
       }
 
       // 3. Dispatch each suggestion to Jules
-      const sourceResource = `sources/github/yasserbousrih/${repoName.replace(/^sources\/github\/[^/]+\//, "")}`;
+      const sourceResource = resolveCanonicalSource(repoName.replace(/^sources\/github\/[^/]+\//, ""));
       const dispatchResults: any[] = [];
 
       for (const s of toDispatch) {
@@ -2684,7 +3290,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
 
         const sourceResource = sourceInput.startsWith("sources/")
           ? sourceInput
-          : `sources/github/yasserbousrih/${sourceInput.replace(/^sources\/github\//, "")}`;
+          : resolveCanonicalSource(sourceInput.replace(/^sources\/github\//, ""));
 
         const decoratedPrompt = decoratePrompt(taskPrompt, sourceInput);
 
@@ -3054,7 +3660,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
       const sourceInput = args.source as string;
       const sourceResource = sourceInput.startsWith("sources/")
         ? sourceInput
-        : `sources/github/yasserbousrih/${sourceInput.replace(/^sources\/github\//, "")}`;
+        : resolveCanonicalSource(sourceInput.replace(/^sources\/github\//, ""));
 
       const { data, account } = await requestWithFallback(sourceResource);
       return {
@@ -3082,13 +3688,13 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
       const accountTarget = args.account as string | undefined;
 
       const cleanRepo = sourceInput.toLowerCase().replace(/^sources\/github\/[^\/]+\//, "");
-      if (DEPRECATED_REPOS[cleanRepo]) {
-        throw new Error(`Repository '${cleanRepo}' is deprecated. Reason: ${DEPRECATED_REPOS[cleanRepo]}`);
+      if (getDeprecatedRepos()[cleanRepo]) {
+        throw new Error(`Repository '${cleanRepo}' is deprecated. Reason: ${getDeprecatedRepos()[cleanRepo]}`);
       }
 
       const sourceResource = sourceInput.startsWith("sources/")
         ? sourceInput
-        : `sources/github/yasserbousrih/${sourceInput.replace(/^sources\/github\//, "")}`;
+        : resolveCanonicalSource(sourceInput.replace(/^sources\/github\//, ""));
 
       const decoratedPrompt = decoratePrompt(prompt, sourceInput);
 
@@ -3145,18 +3751,18 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
       for (const t of tasks) {
         try {
           const cleanRepo = t.source.toLowerCase().replace(/^sources\/github\/[^\/]+\//, "");
-          if (DEPRECATED_REPOS[cleanRepo]) {
+          if (getDeprecatedRepos()[cleanRepo]) {
             results.push({
               status: "error",
               source: t.source,
-              error: `Repository is deprecated: ${DEPRECATED_REPOS[cleanRepo]}`,
+              error: `Repository is deprecated: ${getDeprecatedRepos()[cleanRepo]}`,
             });
             continue;
           }
 
           const sourceResource = t.source.startsWith("sources/")
             ? t.source
-            : `sources/github/yasserbousrih/${t.source.replace(/^sources\/github\//, "")}`;
+            : resolveCanonicalSource(t.source.replace(/^sources\/github\//, ""));
 
           const decoratedPrompt = decoratePrompt(t.prompt, t.source);
 
@@ -3339,7 +3945,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     // ----------------------------------------------------
     if (name === "jules_get_plan") {
       const sessionId = (args.session_id as string).replace("sessions/", "");
-      const { data } = await requestWithFallback(`sessions/${sessionId}/activities?pageSize=50`);
+      const { data } = await requestWithFallback(`sessions/${sessionId}/activities?pageSize=500`);
 
       const activities = data.activities || [];
       for (const act of activities) {
@@ -3554,7 +4160,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
     // ----------------------------------------------------
     if (name === "jules_sync_prs") {
       const sessionId = args.session_id as string | undefined;
-      const scriptPath = "/root/.local/bin/jules-sync-prs";
+      const scriptPath = process.env.JULES_SYNC_PRS_BIN || path.join(os.homedir(), ".local", "bin", "jules-sync-prs");
 
       if (fs.existsSync(scriptPath)) {
         try {
@@ -3667,7 +4273,7 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
         try {
           const sourceResource = task.source.startsWith("sources/")
             ? task.source
-            : `sources/github/yasserbousrih/${task.source.replace(/^sources\/github\//, "")}`;
+            : resolveCanonicalSource(task.source.replace(/^sources\/github\//, ""));
 
           const payload: any = {
             prompt: decoratePrompt(task.prompt, task.source),
@@ -3756,7 +4362,8 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
           try {
             const res = await request("sessions?pageSize=50", acc.key);
             const sessions = res.sessions || [];
-            const active = sessions.filter((s: any) => s.state === "IN_PROGRESS").length;
+            const TERMINAL = ["COMPLETED", "FAILED", "CANCELLED", "STATE_UNSPECIFIED"];
+            const active = sessions.filter((s: any) => !TERMINAL.includes(s.state)).length;
             const completed = sessions.filter((s: any) => s.state === "COMPLETED").length;
 
             return {
@@ -3765,6 +4372,9 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
               daily_limit: 15,
               used_last_24h: q.usedLast24h,
               remaining_24h_quota: q.remaining,
+              concurrent_limit: 5,
+              concurrent_active: active,
+              concurrent_available: Math.max(0, 5 - active),
               next_reset_in_minutes: q.nextResetMinutes ?? 0,
               active_sessions: active,
               completed_sessions: completed,
@@ -3979,7 +4589,8 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
 async function run() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  process.stderr.write("Jules MCP Server running on stdio (38 tools)\n");
+  startAutonomousWatchdog();
+  process.stderr.write("Jules MCP Server running on stdio (41 tools)\n");
 }
 
 run().catch((error) => {
