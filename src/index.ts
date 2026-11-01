@@ -309,13 +309,8 @@ function getRepoEnv(repoIdentifier: string): Record<string, string> | undefined 
 }
 
 function detectActiveProfile(): string {
-  const hermesHome = process.env.HERMES_HOME || "";
-  if (hermesHome.includes("/profiles/")) {
-    return hermesHome.split("/profiles/")[1].split("/")[0];
-  }
-  if (process.env.HERMES_SESSION_PROFILE) {
-    return process.env.HERMES_SESSION_PROFILE;
-  }
+  const profile = process.env.MCP_SESSION_PROFILE || process.env.AI_PROFILE || process.env.SESSION_PROFILE;
+  if (profile) return profile;
   return "default";
 }
 
@@ -338,9 +333,9 @@ function saveOrigins(ledger: OriginsLedger) {
 
 function recordSessionOrigin(sessionId: string, source: string, profileOverride?: string, account?: string) {
   const profile = profileOverride || detectActiveProfile();
-  const chatId = process.env.HERMES_SESSION_CHAT_ID || undefined;
-  const platform = process.env.HERMES_SESSION_PLATFORM || undefined;
-  const threadId = process.env.HERMES_SESSION_THREAD_ID || undefined;
+  const chatId = process.env.MCP_SESSION_CHAT_ID || undefined;
+  const platform = process.env.MCP_SESSION_PLATFORM || undefined;
+  const threadId = process.env.MCP_SESSION_THREAD_ID || undefined;
   const ledger = loadOrigins();
   if (!ledger.sessions) ledger.sessions = {};
   const cleanSid = sessionId.replace(/^sessions\//, "");
