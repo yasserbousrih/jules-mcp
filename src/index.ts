@@ -29,6 +29,7 @@ const SCHEDULES_PATH = process.env.JULES_SCHEDULES_PATH || path.join(JULES_DIR, 
 const MEMORIES_PATH = process.env.JULES_MEMORIES_PATH || path.join(JULES_DIR, "memories.json");
 const SETUP_SCRIPTS_PATH = process.env.JULES_SETUP_SCRIPTS_PATH || path.join(JULES_DIR, "setup_scripts.json");
 const AUTHORSHIP_PATH = process.env.JULES_AUTHORSHIP_PATH || path.join(JULES_DIR, "authorship.json");
+const RECIPES_PATH = process.env.JULES_RECIPES_PATH || path.join(JULES_DIR, "recipes.json");
 const API_BASE = "https://jules.googleapis.com/v1alpha";
 
 interface Account {
@@ -545,7 +546,7 @@ interface ChoreRecipe {
   buildPrompt: (target: string, extra?: string) => string;
 }
 
-const CHORE_RECIPES: Record<string, ChoreRecipe> = {
+const DEFAULT_CHORE_RECIPES: Record<string, ChoreRecipe> = {
   "scaffold-unit-test": {
     name: "Scaffold Unit Tests",
     description: "Write comprehensive unit tests with edge cases, happy paths, and error scenarios for target file/module.",
@@ -576,7 +577,41 @@ const CHORE_RECIPES: Record<string, ChoreRecipe> = {
     buildPrompt: (target, extra) =>
       `Refactor helper logic in \`${target}\` for maximum clarity, readability, and performance. Keep all function signatures and public APIs 100% backward-compatible.${extra ? ` Instructions: ${extra}` : ""}`,
   },
+  "fix-n-plus-one": {
+    name: "Fix N+1 Sequential Loop",
+    description: "Parallelize sequential awaits with Promise.all / asyncio.gather or batch operations into chunks of 50-100.",
+    buildPrompt: (target, extra) =>
+      `Analyze \`${target}\` for sequential await patterns in loops (N+1 queries/requests). Refactor to batch requests or run concurrent chunks using Promise.all/asyncio.gather without breaking idempotency.${extra ? ` Instructions: ${extra}` : ""}`,
+  },
+  "audit-security-secrets": {
+    name: "Audit & Eliminate Hardcoded Secrets",
+    description: "Audit target file for hardcoded credentials, weak randomness (Math.random), or permissive CORS, replacing them with secure vault patterns.",
+    buildPrompt: (target, extra) =>
+      `Audit \`${target}\` for security vulnerabilities: remove any hardcoded tokens/passwords (replace with process.env / config vault), replace Math.random() with crypto.randomBytes/randomInt in security contexts, and verify auth middleware.${extra ? ` Instructions: ${extra}` : ""}`,
+  },
 };
+
+function getChoreRecipes(): Record<string, ChoreRecipe> {
+  const customRecipes: Record<string, ChoreRecipe> = {};
+  try {
+    if (fs.existsSync(RECIPES_PATH)) {
+      const data = JSON.parse(fs.readFileSync(RECIPES_PATH, "utf-8"));
+      for (const [key, item] of Object.entries(data as Record<string, any>)) {
+        customRecipes[key] = {
+          name: item.name || key,
+          description: item.description || "Custom user recipe",
+          buildPrompt: (target, extra) => {
+            const template = item.prompt_template || item.template || `Execute chore on ${target}.`;
+            return template.replace(/\{target\}/g, target).replace(/\{extra\}/g, extra || "") + (extra ? ` Instructions: ${extra}` : "");
+          },
+        };
+      }
+    }
+  } catch {}
+  return { ...DEFAULT_CHORE_RECIPES, ...customRecipes };
+}
+
+const CHORE_RECIPES = DEFAULT_CHORE_RECIPES;
 
 function loadConfig(): JulesConfig {
   if (fs.existsSync(CONFIG_PATH)) {
@@ -3716,11 +3751,12 @@ When opening a Pull Request, reference "Fixes #${issueNum}" in the description s
       const autoCreatePr = args.auto_create_pr !== false;
       const waitForCompletion = !!args.wait_for_completion;
 
-      const recipe = CHORE_RECIPES[recipeKey];
+      const allRecipes = getChoreRecipes();
+      const recipe = allRecipes[recipeKey];
       if (!recipe) {
         throw new Error(
           `Invalid recipe '${recipeKey}'. Available recipes:\n` +
-            Object.entries(CHORE_RECIPES)
+            Object.entries(getChoreRecipes())
               .map(([k, v]) => `• \`${k}\`: ${v.description}`)
               .join("\n")
         );
