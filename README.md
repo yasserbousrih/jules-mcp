@@ -1,71 +1,70 @@
-# Jules MCP Server (`jules-mcp`)
+# Jules MCP Server (`jules-mcp` v2.0.0)
 
-Universal Model Context Protocol (MCP) server for Google Jules Cloud Agent with 100% native REST API coverage, multi-account pooling, automated load balancing, 24-hour rolling quota ledger, container test runner auto-injection, standardized chore recipes, persistent quota queuing, file collision locks, exponential backoff retries, semantic conflict resolution, preflight conflict dry-runs, and multi-session 3-way consolidation.
+Universal Model Context Protocol (MCP) server, autonomous background scheduler, CI auto-healer, issue dispatcher, and CLI for Google Jules Cloud Agent with 100% native REST API coverage, multi-account pooling, automated load balancing, 24-hour rolling quota ledger, container test runner auto-injection, standardized chore recipes, persistent quota queuing, file collision locks, exponential backoff retries, semantic conflict resolution, preflight conflict dry-runs, and multi-session 3-way consolidation.
 
-### Key Capabilities:
-1. **Parallel Cloud Dispatching**: Fire multiple chores on the same repo or across repos concurrently.
-2. **Local 3-Way Patch Reconciliation (`jules_consolidate_sessions`)**: Fetches unidiff patches from all completed sessions, applies them sequentially with `git apply --3way` and semantic fallback for non-overlapping imports/functions, runs project test suites, and opens **1 clean consolidated GitHub PR**—eliminating PR collisions and branch drift completely.
-3. **Preflight Dry-Run Conflict Check (`jules_verify_patch`)**: Evaluates a completed session's unidiff patch against a local workspace using `git apply --check --3way` before modifying any files or branches.
-4. **Persistent Quota Task Queue (`jules_queue_status` / `jules_drain_queue`)**: Holds tasks in `~/.config/jules/queue.json` when the rolling 24-hour pool quota is saturated and drains them automatically as slots open up.
-5. **In-Flight File Locks (`jules_inspect_locks`)**: Tracks active tasks per file in `~/.config/jules/locks.json` to prevent concurrent colliding modifications to the same file.
-6. **Exponential Backoff & Network Jitter**: Retries transient Google Jules API drops (500/502/503/504, network drops, timeouts) with randomized exponential delay.
-7. **Standardized Chore Recipes (`jules_recipe_dispatch`)**: High-efficiency blueprints for recurring grunt work (`scaffold-unit-test`, `add-strict-types`, `document-endpoints`, `clean-dead-code`, `refactor-isolated-helper`).
-8. **Rolling 24-Hour Quota Ledger (`jules_pool_status`)**: Tracks timestamps for every dispatch across all 3 accounts in `~/.config/jules/usage.json`, ensuring guaranteed quota and predicting reset minutes with zero silent 429 errors.
-9. **Container Test Runner Auto-Injection**: Detects repository stack (Python/FastAPI vs Next.js/TypeScript) and injects explicit container sandbox test instructions (`pytest` / `npm run build && npm test`) into Jules's execution prompt.
-10. **Automated Remote PR Rebase (`jules_rebase_pr`)**: Rebases outdated cloud PRs against the latest `main` branch locally and force-pushes with lease.
-11. **Zero Freeze Pauses**: Autonomous unblocking directives, auto-plan approvals, and `jules_auto_nudge_all`.
+Compatible across all major AI coding harnesses: **Hermes, Claude Code, Cursor, Codex, and Windsurf**.
 
 ---
 
-## Complete MCP Tool Reference (34 Tools)
+## Complete MCP Tool Reference (53 Native Tools)
 
-### 1. Harness Intelligence, Queue & Multi-Session Consolidation
-- **`jules_consolidate_sessions`** — Reconcile and merge multiple concurrent Jules sessions on the SAME repository into a single clean local branch or unified PR. Uses 3-way unidiff application and semantic conflict resolution to resolve cloud branch drift automatically, runs tests, and creates 1 clean PR.
-- **`jules_verify_patch`** — Dry-run preflight check: inspects a completed session's git patch and runs `git apply --check --3way` against a local workspace to verify whether the patch will apply cleanly with 0 conflicts before creating branches or writing files.
-- **`jules_recipe_dispatch`** — Dispatch a standardized, high-efficiency chore recipe with pre-tested prompt blueprints (`scaffold-unit-test`, `add-strict-types`, `document-endpoints`, `clean-dead-code`, `refactor-isolated-helper`).
-- **`jules_queue_status`** — Inspect persistent task queue (`~/.config/jules/queue.json`), queued backlog depth, available pool slots, and countdown to earliest slot reset.
-- **`jules_drain_queue`** — Drain and dispatch queued tasks to Google Jules accounts with newly available 24h rolling quota slots.
-- **`jules_inspect_locks`** — List active in-flight file locks across repositories to monitor parallel task partitioning and prevent file collisions.
-- **`jules_rebase_pr`** — Rebases an existing Jules PR against latest `main` branch locally and force-pushes with lease, eliminating GitHub out-of-date branch warnings.
-- **`jules_check_events`** — Real-time event monitor for the entire multi-account pool: detects stuck tasks, plans needing approval, completed tasks, and failures.
-- **`jules_auto_nudge_all`** — Pool-wide autonomous unblocker: unblocks all sessions paused in `AWAITING_USER_FEEDBACK` with standard execution directives.
-- **`jules_wait_for_task`** — Synchronously blocks/polls for a session until completion or input request with automatic plan approval and auto-unblocking.
+### 1. Autonomous Intelligence, Watchdog & Scheduled Tasks
+- **`jules_schedule_task`** — Set up recurring maintenance tasks (daily, weekly, hourly) that run automatically in the background without manual prompting.
+- **`jules_list_schedules`** — List all active and paused recurring scheduled tasks, last run timestamps, and next run countdowns.
+- **`jules_delete_schedule`** — Delete or pause a recurring scheduled task by ID.
+- **`jules_poll_watchdog`** — Trigger an immediate autonomous watchdog cycle: detects stuck questions, logs real-time events, notifies new PRs, and auto-drains queued tasks into newly opened slots.
+- **`jules_get_events`** — Query the rolling cross-harness background event ledger (`~/.config/jules/events.json`).
+- **`jules_get_stuck_sessions`** — One-shot scan across all accounts for stuck sessions, extracting the exact question asked by Jules and ready-to-run unblock commands.
+- **`jules_auto_nudge_all`** — Pool-wide autonomous unblocker: broadcasts unblocking directives to all stuck sessions.
+- **`jules_check_events`** — Real-time event monitor across accounts: detects stuck tasks, plans awaiting approval, completed PRs, and failures.
+- **`jules_wait_for_task`** — Synchronously wait for a session until completion with auto-plan approval and auto-unblocking.
 - **`jules_dispatch_and_wait`** — Single-call chore execution: decorates prompt with architectural guardrails, dispatches to least-loaded account, and waits.
-- **`jules_queue_tasks`** — Sequentially executes a pipeline of chores on the same repo (waits for Task N before launching Task N+1).
 - **`jules_stream_progress`** — Generates a structured markdown execution timeline: step-by-step plan checklist `[x]`, internal thought reasoning trail, files modified, and sandbox bash commands.
 
-### 2. Local Git & GitHub PR Automation
+### 2. Auto-Healing, Planning Critic & GitHub Integration
+- **`jules_heal_ci`** — Autonomous CI Auto-Healer: inspects failing GitHub Actions checks on a Jules PR, extracts the failure traceback, and dispatches a healing directive back to the Jules session to fix the error and update the PR.
+- **`jules_plan_critic`** — Adversarial Planning Critic Agent: analyzes generated multi-step plans for regression risks, missing test verification, and fake mock bypasses before implementation begins.
+- **`jules_dispatch_issue`** — GitHub Issue Dispatcher: converts an open GitHub Issue into an autonomous Jules chore, linking the PR back to close the issue automatically.
+- **`jules_export_workspace`** — Workspace Exporter (Turndown Tool): exports all connected repos, memories, schedules, setup scripts, authorship, and session history (summaries, activities, and diff patches) to `~/jules-export`.
+
+### 3. Repository Memories, Setup Scripts & Authorship Vault
+- **`jules_set_repo_memory`** — Store persistent agentic memories, coding conventions, architectural rules, or constraints for a repository (auto-injected into future sessions).
+- **`jules_get_repo_memories`** — Retrieve all persistent agentic memories and custom rules stored for a repository.
+- **`jules_delete_repo_memory`** — Delete a stored memory or rule from a repository vault.
+- **`jules_set_setup_script`** — Configure a pre-flight container setup script (`setup.sh`) executed inside the cloud VM before writing code or running tests.
+- **`jules_configure_authorship`** — Configure Git commit authorship (`co_authored`, `user_only`, or `jules_only`) so commits attribute to your GitHub account.
+- **`jules_set_repo_env`** / **`jules_get_repo_env`** / **`jules_delete_repo_env`** — Securely store, inspect, and delete environment variables injected into the cloud container sandbox.
+
+### 4. Local Git & Multi-Session 3-Way Consolidation
+- **`jules_consolidate_sessions`** — Reconcile and merge multiple concurrent Jules sessions on the SAME repository into a single clean local branch or unified PR. Uses 3-way unidiff application and semantic conflict resolution to resolve cloud branch drift automatically, runs tests, and creates 1 clean PR.
+- **`jules_verify_patch`** — Dry-run preflight check: inspects a completed session's git patch and runs `git apply --check --3way` against a local workspace to verify whether the patch will apply cleanly with 0 conflicts before creating branches or writing files.
 - **`jules_apply_patch`** — Fetches clean unidiff patches from completed sessions and applies them directly into a local git repository, creates fix branches, executes test suites (`npm test` / `pytest`), and auto-commits.
+- **`jules_rebase_pr`** — Rebases an existing Jules PR against latest `main` branch locally and force-pushes with lease.
 - **`jules_review_pr`** — Inspects GitHub Pull Requests opened by Jules (diff stats, review comments, CI status checks) via `gh`.
 - **`jules_merge_pr`** — Safely squash-merges verified GitHub PRs and cleans up remote branches.
 - **`jules_sync_prs`** — Local PR sync runner: applies patches, verifies locally with tests, and creates GitHub PRs.
 
-### 3. Task Dispatching & Multi-Account Load Balancing
+### 5. Multi-Account Pool & Capacity Management
 - **`jules_create_task`** — Dispatches tasks with architectural invariant decoration, container test directives, anti-pause directives, target branches, custom working branch, automated PR creation (`AUTO_CREATE_PR`), and plan approval mode.
 - **`jules_batch_dispatch`** — Launches multiple tasks across repositories simultaneously with multi-account load balancing.
 - **`jules_pool_status`** — Live status of all configured Google accounts (quotas, 24h rolling usage ledger, active in-flight count, completed count, next reset minutes).
+- **`jules_queue_status`** — Inspect persistent task queue (`~/.config/jules/queue.json`), queued backlog depth, available pool slots, and countdown to earliest slot reset.
+- **`jules_drain_queue`** — Drain and dispatch queued tasks to Google Jules accounts with newly available 24h rolling quota slots.
+- **`jules_inspect_locks`** — List active in-flight file locks across repositories to monitor parallel task partitioning and prevent file collisions.
+- **`jules_queue_tasks`** — Sequentially executes a pipeline of chores on the same repo (waits for Task N before launching Task N+1).
+- **`jules_recipe_dispatch`** — Dispatch a standardized, high-efficiency chore recipe with pre-tested prompt blueprints (`scaffold-unit-test`, `add-strict-types`, `document-endpoints`, `clean-dead-code`, `refactor-isolated-helper`).
+- **`jules_run_suggestions`** — Scans local repository for security vulnerabilities, missing test coverage, code health issues, and N+1 performance patterns, deduplicating against a 24h ledger and batch-dispatching them.
 
-### 4. Source & Repository Discovery
-- **`jules_list_sources`** — Lists connected GitHub repositories across all accounts with branch metadata, default branches, and AIP-160 filter support.
-- **`jules_get_source`** — Inspects repository details and all branches for a target repo.
-
-### 5. Interactive Feedback & Plan Approvals
-- **`jules_get_plan`** — Extracts structured step-by-step plans generated by Jules.
-- **`jules_approve_plan`** — Approves a plan to unblock code implementation.
-- **`jules_reply_feedback`** — Sends messages and instructions directly to Jules when paused in `AWAITING_USER_FEEDBACK`.
-
-### 6. Artifacts, Terminal Logs & Outputs
-- **`jules_get_session`** — Retrieves full session details, PR URL, git patch, and execution timeline.
-- **`jules_get_patch`** — Extracts clean git unidiff patches and suggested commit messages.
-- **`jules_inspect_bash_logs`** — Extracts all terminal shell commands executed inside Google's cloud sandbox with exit codes and stdout/stderr output.
-- **`jules_get_media_artifacts`** — Extracts visual media (screenshots, diagrams, test failure images) generated in the container.
-- **`jules_list_activities`** — Streams granular activity trails with pagination.
-- **`jules_get_activity`** — Retrieves a single activity event payload.
-
-### 7. Session Lifecycle
-- **`jules_list_sessions`** — Filters sessions across accounts by state, repository, or AIP-160 filter.
-- **`jules_archive_session`** — Archives or unarchives sessions.
-- **`jules_delete_session`** — Permanently deletes a session across accounts.
+### 6. Interactive Feedback, Activities & Lifecycle
+- **`jules_list_sources`** / **`jules_get_source`** — Discover connected GitHub repositories and branch metadata.
+- **`jules_list_sessions`** / **`jules_get_session`** — Inspect session lifecycle and outputs.
+- **`jules_list_activities`** / **`jules_get_activity`** — Granular chronological activity trails.
+- **`jules_get_plan`** / **`jules_approve_plan`** — Plan inspection and approval.
+- **`jules_reply_feedback`** — Send unblocking feedback directly to active sessions.
+- **`jules_get_patch`** — Extract clean git unidiff patches.
+- **`jules_inspect_bash_logs`** — Extract terminal shell outputs from Google's cloud sandbox.
+- **`jules_get_media_artifacts`** — Extract visual media artifacts generated in the container.
+- **`jules_archive_session`** / **`jules_delete_session`** — Workspace session management.
 
 ---
 
