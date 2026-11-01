@@ -70,13 +70,13 @@ class TestMcpClient {
 describe("Jules MCP Server & Tool Registry v1.6.0", () => {
   let client: TestMcpClient;
 
-  it("should initialize MCP server and register 41 tools", async () => {
+  it("should initialize MCP server and register 49 tools", async () => {
     client = new TestMcpClient();
     await client.init();
 
     const listRes = await client.send("tools/list");
     assert.ok(listRes.tools, "tools array must exist");
-    assert.equal(listRes.tools.length, 41, "Must register exactly 38 native tools");
+    assert.equal(listRes.tools.length, 49, "Must register exactly 38 native tools");
 
     const toolNames = listRes.tools.map((t: any) => t.name);
     assert.ok(toolNames.includes("jules_pool_status"));
@@ -93,6 +93,65 @@ describe("Jules MCP Server & Tool Registry v1.6.0", () => {
     assert.ok(toolNames.includes("jules_queue_status"));
     assert.ok(toolNames.includes("jules_drain_queue"));
     assert.ok(toolNames.includes("jules_inspect_locks"));
+  });
+
+  it("should schedule and manage recurring tasks via jules_schedule_task and jules_list_schedules", async () => {
+    const res = await client.callTool("jules_schedule_task", {
+      source: "Agent-Brain",
+      prompt: "Daily audit of memory consistency and tenant isolation",
+      title: "Daily Memory Audit",
+      cadence: "daily",
+    });
+    assert.ok(res.content && res.content.length >= 2);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.ok(parsed.scheduled);
+    assert.ok(parsed.task?.id);
+
+    const listRes = await client.callTool("jules_list_schedules");
+    const listParsed = JSON.parse(listRes.content[0].text);
+    assert.ok(listParsed.count >= 1);
+
+    // Delete created schedule
+    const delRes = await client.callTool("jules_delete_schedule", { id: parsed.task.id });
+    const delParsed = JSON.parse(delRes.content[0].text);
+    assert.equal(delParsed.deleted, true);
+  });
+
+  it("should store and retrieve agentic repository memories via jules_set_repo_memory", async () => {
+    const res = await client.callTool("jules_set_repo_memory", {
+      repo: "Agent-Brain",
+      memory: "Always use node:test and assert/strict for unit testing; never use Jest",
+      category: "testing",
+    });
+    assert.ok(res.content && res.content.length >= 2);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.ok(parsed.saved);
+
+    const getRes = await client.callTool("jules_get_repo_memories", { repo: "Agent-Brain" });
+    const getParsed = JSON.parse(getRes.content[0].text);
+    assert.ok(getParsed.memories["agent-brain"]?.length >= 1);
+
+    // Delete memory
+    const delRes = await client.callTool("jules_delete_repo_memory", { repo: "Agent-Brain", index: 0 });
+    const delParsed = JSON.parse(delRes.content[0].text);
+    assert.equal(delParsed.deleted, true);
+  });
+
+  it("should configure container initial setup scripts and commit authorship", async () => {
+    const setupRes = await client.callTool("jules_set_setup_script", {
+      repo: "Agent-Brain",
+      script: "npm install --package-lock-only && npm test",
+    });
+    const setupParsed = JSON.parse(setupRes.content[0].text);
+    assert.equal(setupParsed.saved, true);
+
+    const authRes = await client.callTool("jules_configure_authorship", {
+      mode: "co_authored",
+      author_name: "Open Source Developer",
+      author_email: "dev@example.com",
+    });
+    const authParsed = JSON.parse(authRes.content[0].text);
+    assert.equal(authParsed.configured, true);
   });
 
   it("should manage repo env vault via jules_set_repo_env and jules_get_repo_env", async () => {

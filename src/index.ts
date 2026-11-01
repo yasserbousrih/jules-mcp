@@ -25,6 +25,10 @@ const INVARIANTS_PATH = process.env.JULES_INVARIANTS_PATH || path.join(JULES_DIR
 const DEPRECATED_PATH = process.env.JULES_DEPRECATED_PATH || path.join(JULES_DIR, "deprecated_repos.json");
 const EVENTS_PATH = process.env.JULES_EVENTS_PATH || path.join(JULES_DIR, "events.json");
 const WATCHDOG_STATE_PATH = process.env.JULES_WATCHDOG_STATE_PATH || path.join(JULES_DIR, "watchdog_state.json");
+const SCHEDULES_PATH = process.env.JULES_SCHEDULES_PATH || path.join(JULES_DIR, "schedules.json");
+const MEMORIES_PATH = process.env.JULES_MEMORIES_PATH || path.join(JULES_DIR, "memories.json");
+const SETUP_SCRIPTS_PATH = process.env.JULES_SETUP_SCRIPTS_PATH || path.join(JULES_DIR, "setup_scripts.json");
+const AUTHORSHIP_PATH = process.env.JULES_AUTHORSHIP_PATH || path.join(JULES_DIR, "authorship.json");
 const API_BASE = "https://jules.googleapis.com/v1alpha";
 
 interface Account {
@@ -948,6 +952,137 @@ CRITICAL AUTONOMOUS EXECUTION DIRECTIVES:
 }
 
 
+
+// --- Feature Engine: Recurring Schedules, Setup Scripts, Agentic Memories, Authorship ---
+
+export interface ScheduledTask {
+  id: string;
+  source: string;
+  prompt: string;
+  title?: string;
+  cadence: "daily" | "weekly" | "hourly" | string;
+  intervalMs: number;
+  lastRunAt?: number;
+  nextRunAt: number;
+  enabled: boolean;
+  createdAt: number;
+}
+
+export interface SchedulesLedger {
+  tasks: ScheduledTask[];
+}
+
+export interface RepoMemoryRecord {
+  memory: string;
+  category?: string;
+  addedAt: number;
+}
+
+export interface RepoMemoriesVault {
+  memories: Record<string, RepoMemoryRecord[]>;
+}
+
+export interface SetupScriptsVault {
+  scripts: Record<string, string>;
+}
+
+export interface AuthorshipConfig {
+  mode: "jules_only" | "co_authored" | "user_only";
+  authorName?: string;
+  authorEmail?: string;
+}
+
+function loadSchedules(): SchedulesLedger {
+  try {
+    if (fs.existsSync(SCHEDULES_PATH)) {
+      return JSON.parse(fs.readFileSync(SCHEDULES_PATH, "utf-8"));
+    }
+  } catch {}
+  return { tasks: [] };
+}
+
+function saveSchedules(ledger: SchedulesLedger) {
+  try {
+    const dir = path.dirname(SCHEDULES_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(SCHEDULES_PATH, JSON.stringify(ledger, null, 2), "utf-8");
+  } catch {}
+}
+
+function loadRepoMemories(): RepoMemoriesVault {
+  try {
+    if (fs.existsSync(MEMORIES_PATH)) {
+      return JSON.parse(fs.readFileSync(MEMORIES_PATH, "utf-8"));
+    }
+  } catch {}
+  return { memories: {} };
+}
+
+function saveRepoMemories(vault: RepoMemoriesVault) {
+  try {
+    const dir = path.dirname(MEMORIES_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(MEMORIES_PATH, JSON.stringify(vault, null, 2), "utf-8");
+  } catch {}
+}
+
+function loadSetupScripts(): SetupScriptsVault {
+  try {
+    if (fs.existsSync(SETUP_SCRIPTS_PATH)) {
+      return JSON.parse(fs.readFileSync(SETUP_SCRIPTS_PATH, "utf-8"));
+    }
+  } catch {}
+  return { scripts: {} };
+}
+
+function saveSetupScripts(vault: SetupScriptsVault) {
+  try {
+    const dir = path.dirname(SETUP_SCRIPTS_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(SETUP_SCRIPTS_PATH, JSON.stringify(vault, null, 2), "utf-8");
+  } catch {}
+}
+
+function loadAuthorshipConfig(): AuthorshipConfig {
+  try {
+    if (fs.existsSync(AUTHORSHIP_PATH)) {
+      return JSON.parse(fs.readFileSync(AUTHORSHIP_PATH, "utf-8"));
+    }
+  } catch {}
+  return {
+    mode: "co_authored",
+    authorName: process.env.JULES_AUTHOR_NAME,
+    authorEmail: process.env.JULES_AUTHOR_EMAIL,
+  };
+}
+
+function saveAuthorshipConfig(config: AuthorshipConfig) {
+  try {
+    const dir = path.dirname(AUTHORSHIP_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(AUTHORSHIP_PATH, JSON.stringify(config, null, 2), "utf-8");
+  } catch {}
+}
+
+function parseCadenceIntervalMs(cadence: string): number {
+  const norm = cadence.toLowerCase().trim();
+  if (norm === "hourly") return 60 * 60 * 1000;
+  if (norm === "daily") return 24 * 60 * 60 * 1000;
+  if (norm === "weekly") return 7 * 24 * 60 * 60 * 1000;
+  if (norm === "monthly") return 30 * 24 * 60 * 60 * 1000;
+
+  const match = norm.match(/^(\d+)\s*(m|min|h|hr|d|day|w|week)s?$/);
+  if (match) {
+    const val = parseInt(match[1], 10);
+    const unit = match[2];
+    if (unit.startsWith("m")) return val * 60 * 1000;
+    if (unit.startsWith("h")) return val * 60 * 60 * 1000;
+    if (unit.startsWith("d")) return val * 24 * 60 * 60 * 1000;
+    if (unit.startsWith("w")) return val * 7 * 24 * 60 * 60 * 1000;
+  }
+  return 24 * 60 * 60 * 1000;
+}
+
 // --- Autonomous Watchdog & Event Notification Engine ---
 
 export interface JulesEvent {
@@ -1250,7 +1385,53 @@ export async function runWatchdogCycle(): Promise<{ stuckCount: number; prCount:
     } catch {}
   }
 
-  // 4. Auto-Drain Queue if free slots exist
+  // 4. Autonomous Scheduled Tasks Evaluation
+  const schedulesLedger = loadSchedules();
+  const now = Date.now();
+  let scheduledRuns = 0;
+
+  for (const st of schedulesLedger.tasks) {
+    if (!st.enabled) continue;
+    if (now >= st.nextRunAt && availableSlots > 0) {
+      try {
+        const sourceResource = resolveCanonicalSource(st.source);
+        const payload: any = {
+          prompt: decoratePrompt(st.prompt, st.source),
+          sourceContext: {
+            source: sourceResource,
+            githubRepoContext: { startingBranch: "main" },
+          },
+          automationMode: "AUTO_CREATE_PR",
+        };
+        if (st.title) payload.title = `[Scheduled: ${st.cadence}] ${st.title}`;
+
+        const { data: created, account: chosenAccount } = await createSessionWithFallback(payload);
+        const sid = created.id || created.name?.replace("sessions/", "");
+        st.lastRunAt = now;
+        st.nextRunAt = now + st.intervalMs;
+        scheduledRuns++;
+        availableSlots--;
+
+        appendEvent({
+          type: "task_completed",
+          session_id: sid,
+          repo: st.source,
+          title: st.title || st.prompt.slice(0, 40),
+          account: chosenAccount.name || chosenAccount.email,
+          details: { scheduled: true, cadence: st.cadence },
+        });
+
+        const schedMsg = `⏰ [Jules Scheduler] Dispatched recurring task: [${st.source}] "${st.title || st.prompt.slice(0, 40)}" (Session ${sid}) on ${chosenAccount.name || chosenAccount.email}`;
+        alerts.push(schedMsg);
+        safeSendLoggingMessage({ level: "info", data: schedMsg, logger: "jules-scheduler" });
+      } catch {}
+    }
+  }
+  if (scheduledRuns > 0) {
+    saveSchedules(schedulesLedger);
+  }
+
+  // 5. Auto-Drain Queue if free slots exist
   let drainedCount = 0;
   const queue = loadTaskQueue();
   if (queue.tasks.length > 0 && availableSlots > 0) {
@@ -1308,7 +1489,7 @@ function startAutonomousWatchdog() {
 const server = new Server(
   {
     name: "jules-mcp",
-    version: "1.7.0",
+    version: "1.8.0",
   },
   {
     capabilities: {
@@ -1321,6 +1502,152 @@ const server = new Server(
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
+      {
+        name: "jules_schedule_task",
+        description:
+          "Create or update a recurring scheduled maintenance task for Jules (e.g. Daily Security Audit, Weekly Dependency Upgrade, Nightly Lint/Performance Sweep) that runs automatically in the background.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            source: {
+              type: "string",
+              description: "Target repository identifier or name (e.g. 'my-repo' or 'sources/github/owner/my-repo')",
+            },
+            prompt: {
+              type: "string",
+              description: "Instruction prompt detailing the recurring chore to execute.",
+            },
+            title: {
+              type: "string",
+              description: "Human-readable title for the scheduled task.",
+            },
+            cadence: {
+              type: "string",
+              description: "Run cadence: 'daily', 'weekly', 'hourly', or interval like '12h', '3d'. Defaults to 'daily'.",
+            },
+          },
+          required: ["source", "prompt"],
+        },
+      },
+      {
+        name: "jules_list_schedules",
+        description: "List all active and paused recurring scheduled tasks for Google Jules.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "jules_delete_schedule",
+        description: "Delete or pause a recurring scheduled task by ID.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            id: {
+              type: "string",
+              description: "The scheduled task ID to remove.",
+            },
+          },
+          required: ["id"],
+        },
+      },
+      {
+        name: "jules_set_repo_memory",
+        description:
+          "Store persistent agentic memories, coding conventions, architectural rules, or constraints for a repository that are automatically injected into every future Jules session for that repo.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            repo: {
+              type: "string",
+              description: "Target repository name or identifier.",
+            },
+            memory: {
+              type: "string",
+              description: "The architectural rule, coding convention, or fact to remember (e.g. 'Use node:test instead of Jest', 'Tailwind colors must use theme tokens').",
+            },
+            category: {
+              type: "string",
+              description: "Optional category: 'testing', 'architecture', 'styling', 'security'.",
+            },
+          },
+          required: ["repo", "memory"],
+        },
+      },
+      {
+        name: "jules_get_repo_memories",
+        description: "Retrieve all persistent agentic memories and custom rules stored for a repository.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            repo: {
+              type: "string",
+              description: "Target repository name or identifier. If omitted, returns memories across all repos.",
+            },
+          },
+        },
+      },
+      {
+        name: "jules_delete_repo_memory",
+        description: "Delete a stored memory or rule from a repository vault.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            repo: {
+              type: "string",
+              description: "Target repository name or identifier.",
+            },
+            index: {
+              type: "number",
+              description: "0-based index of the memory to remove.",
+            },
+          },
+          required: ["repo", "index"],
+        },
+      },
+      {
+        name: "jules_set_setup_script",
+        description:
+          "Configure a pre-flight environment setup script (initial setup commands) that Jules executes inside its cloud container VM before writing code or running tests (e.g. 'npm ci && npx prisma generate').",
+        inputSchema: {
+          type: "object",
+          properties: {
+            repo: {
+              type: "string",
+              description: "Target repository name or identifier.",
+            },
+            script: {
+              type: "string",
+              description: "Bash setup script commands to run in container sandbox.",
+            },
+          },
+          required: ["repo", "script"],
+        },
+      },
+      {
+        name: "jules_configure_authorship",
+        description:
+          "Configure Git commit authorship mode for Jules pull requests ('co_authored', 'user_only', or 'jules_only') so commits attribute properly to your GitHub account.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            mode: {
+              type: "string",
+              enum: ["co_authored", "user_only", "jules_only"],
+              description: "Authorship mode.",
+            },
+            author_name: {
+              type: "string",
+              description: "Your full name for git attribution.",
+            },
+            author_email: {
+              type: "string",
+              description: "Your email for git attribution.",
+            },
+          },
+          required: ["mode"],
+        },
+      },
       {
         name: "jules_poll_watchdog",
         description:
@@ -2159,6 +2486,257 @@ server.setRequestHandler(CallToolRequestSchema, async (requestPayload) => {
   const { name, arguments: args = {} } = requestPayload.params;
 
   try {
+    // ----------------------------------------------------
+    // TOOL: jules_schedule_task
+    // ----------------------------------------------------
+    if (name === "jules_schedule_task") {
+      const source = args.source as string;
+      const prompt = args.prompt as string;
+      const title = args.title as string | undefined;
+      const cadence = (args.cadence as string) || "daily";
+
+      const intervalMs = parseCadenceIntervalMs(cadence);
+      const ledger = loadSchedules();
+      const newTask: ScheduledTask = {
+        id: "sched_" + Date.now() + "_" + Math.random().toString(36).substring(2, 6),
+        source,
+        prompt,
+        title,
+        cadence,
+        intervalMs,
+        nextRunAt: Date.now() + intervalMs,
+        enabled: true,
+        createdAt: Date.now(),
+      };
+      ledger.tasks.push(newTask);
+      saveSchedules(ledger);
+
+      const nextIso = new Date(newTask.nextRunAt).toISOString();
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ scheduled: true, task: newTask }, null, 2),
+          },
+          {
+            type: "text",
+            text: `### ⏰ Jules Recurring Task Scheduled\n\n• **ID:** \`${newTask.id}\`\n• **Repo:** \`${newTask.source}\`\n• **Title:** ${newTask.title || "Untitled"}\n• **Cadence:** \`${newTask.cadence}\` (Runs every ${Math.round(intervalMs / 3600000)}h)\n• **Next Execution:** \`${nextIso}\`\n`,
+          },
+        ],
+      };
+    }
+
+    // ----------------------------------------------------
+    // TOOL: jules_list_schedules
+    // ----------------------------------------------------
+    if (name === "jules_list_schedules") {
+      const ledger = loadSchedules();
+      let summary = `# ⏰ Jules Scheduled Tasks (${ledger.tasks.length})\n\n`;
+      if (ledger.tasks.length === 0) {
+        summary += `No recurring tasks configured. Use \`jules_schedule_task\` to automate maintenance routines.\n`;
+      } else {
+        for (const t of ledger.tasks) {
+          const nextIso = new Date(t.nextRunAt).toISOString();
+          const lastIso = t.lastRunAt ? new Date(t.lastRunAt).toISOString() : "Never";
+          summary += `• **[${t.cadence.toUpperCase()}]** \`${t.id}\` on \`${t.source}\` (${t.enabled ? "ACTIVE" : "PAUSED"})\n`;
+          summary += `  **Title:** ${t.title || t.prompt.slice(0, 50)}\n`;
+          summary += `  **Last Run:** ${lastIso} | **Next Run:** ${nextIso}\n\n`;
+        }
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ count: ledger.tasks.length, tasks: ledger.tasks }, null, 2),
+          },
+          {
+            type: "text",
+            text: summary,
+          },
+        ],
+      };
+    }
+
+    // ----------------------------------------------------
+    // TOOL: jules_delete_schedule
+    // ----------------------------------------------------
+    if (name === "jules_delete_schedule") {
+      const id = args.id as string;
+      const ledger = loadSchedules();
+      const initial = ledger.tasks.length;
+      ledger.tasks = ledger.tasks.filter((t) => t.id !== id);
+      const deleted = ledger.tasks.length !== initial;
+      if (deleted) saveSchedules(ledger);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ deleted, id }, null, 2),
+          },
+          {
+            type: "text",
+            text: deleted ? `✅ Deleted scheduled task \`${id}\`.` : `❌ Scheduled task \`${id}\` not found.`,
+          },
+        ],
+      };
+    }
+
+    // ----------------------------------------------------
+    // TOOL: jules_set_repo_memory
+    // ----------------------------------------------------
+    if (name === "jules_set_repo_memory") {
+      const repo = (args.repo as string).toLowerCase().replace(/^sources\/github\/[^/]+\//, "");
+      const memory = args.memory as string;
+      const category = args.category as string | undefined;
+
+      const vault = loadRepoMemories();
+      if (!vault.memories[repo]) vault.memories[repo] = [];
+      const record: RepoMemoryRecord = {
+        memory,
+        category,
+        addedAt: Date.now(),
+      };
+      vault.memories[repo].push(record);
+      saveRepoMemories(vault);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ saved: true, repo, memory: record }, null, 2),
+          },
+          {
+            type: "text",
+            text: `🧠 **Jules Memory Saved for [${repo}]:**\n*"${memory}"*\n(This rule will be injected into all future tasks on ${repo})`,
+          },
+        ],
+      };
+    }
+
+    // ----------------------------------------------------
+    // TOOL: jules_get_repo_memories
+    // ----------------------------------------------------
+    if (name === "jules_get_repo_memories") {
+      const repoInput = args.repo as string | undefined;
+      const vault = loadRepoMemories();
+
+      let targetMemories: Record<string, RepoMemoryRecord[]> = {};
+      if (repoInput) {
+        const clean = repoInput.toLowerCase().replace(/^sources\/github\/[^/]+\//, "");
+        targetMemories[clean] = vault.memories[clean] || [];
+      } else {
+        targetMemories = vault.memories;
+      }
+
+      let summary = `# 🧠 Jules Repository Memories & Custom Rules\n\n`;
+      let total = 0;
+      for (const [r, list] of Object.entries(targetMemories)) {
+        if (list.length === 0) continue;
+        summary += `### Repo: \`${r}\` (${list.length} rules)\n`;
+        list.forEach((m, i) => {
+          summary += `${i + 1}. [${m.category || "rule"}] ${m.memory}\n`;
+        });
+        summary += `\n`;
+        total += list.length;
+      }
+      if (total === 0) {
+        summary += `No memories stored yet. Use \`jules_set_repo_memory\` to train Jules on project rules.\n`;
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ memories: targetMemories }, null, 2),
+          },
+          {
+            type: "text",
+            text: summary,
+          },
+        ],
+      };
+    }
+
+    // ----------------------------------------------------
+    // TOOL: jules_delete_repo_memory
+    // ----------------------------------------------------
+    if (name === "jules_delete_repo_memory") {
+      const repo = (args.repo as string).toLowerCase().replace(/^sources\/github\/[^/]+\//, "");
+      const index = Number(args.index);
+      const vault = loadRepoMemories();
+      const list = vault.memories[repo] || [];
+      let deleted = false;
+      if (index >= 0 && index < list.length) {
+        list.splice(index, 1);
+        vault.memories[repo] = list;
+        saveRepoMemories(vault);
+        deleted = true;
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ deleted, repo, index }, null, 2),
+          },
+          {
+            type: "text",
+            text: deleted ? `✅ Removed memory index ${index} from \`${repo}\`.` : `❌ Invalid memory index ${index} on \`${repo}\`.`,
+          },
+        ],
+      };
+    }
+
+    // ----------------------------------------------------
+    // TOOL: jules_set_setup_script
+    // ----------------------------------------------------
+    if (name === "jules_set_setup_script") {
+      const repo = (args.repo as string).toLowerCase().replace(/^sources\/github\/[^/]+\//, "");
+      const script = args.script as string;
+      const vault = loadSetupScripts();
+      vault.scripts[repo] = script;
+      saveSetupScripts(vault);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ saved: true, repo, script }, null, 2),
+          },
+          {
+            type: "text",
+            text: `🛠️ **Setup Script Configured for [${repo}]:**\n\`\`\`bash\n${script}\n\`\`\`\n(Will run in container sandbox prior to code execution)`,
+          },
+        ],
+      };
+    }
+
+    // ----------------------------------------------------
+    // TOOL: jules_configure_authorship
+    // ----------------------------------------------------
+    if (name === "jules_configure_authorship") {
+      const mode = args.mode as "co_authored" | "user_only" | "jules_only";
+      const authorName = (args.author_name as string) || process.env.JULES_AUTHOR_NAME;
+      const authorEmail = (args.author_email as string) || process.env.JULES_AUTHOR_EMAIL;
+
+      const config: AuthorshipConfig = { mode, authorName, authorEmail };
+      saveAuthorshipConfig(config);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ configured: true, config }, null, 2),
+          },
+          {
+            type: "text",
+            text: `✍️ **Git Commit Authorship Configured:**\n• **Mode:** \`${mode}\`\n• **Author:** ${authorName || "N/A"} <${authorEmail || "N/A"}>\n`,
+          },
+        ],
+      };
+    }
+
     // ----------------------------------------------------
     // TOOL: jules_poll_watchdog
     // ----------------------------------------------------
@@ -4661,7 +5239,7 @@ async function run() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   startAutonomousWatchdog();
-  process.stderr.write("Jules MCP Server running on stdio (41 tools)\n");
+  process.stderr.write("Jules MCP Server running on stdio (49 tools)\n");
 }
 
 run().catch((error) => {
