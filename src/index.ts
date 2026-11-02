@@ -1212,16 +1212,24 @@ async function sendTelegramAlert(text: string): Promise<void> {
 }
 
 async function dispatchWebhookEvent(event: JulesEvent): Promise<void> {
-  // 1. Direct Telegram Alert if configured
+  let alertText = "";
   if (event.type === "session_stuck") {
-    const msg = `🚨 *[Jules Watchdog] Task Stuck (Needs Input)*\n• *Repo:* \`${event.repo || "Unknown"}\` | *ID:* \`${event.session_id}\` [${event.account || ""}]\n• *Title:* ${event.title || ""}\n• *Question:* _"${event.question || ""}"_\n👉 *Reply:* \`jules_reply_feedback(session_id='${event.session_id}', message='<answer>')\``;
-    sendTelegramAlert(msg).catch(() => {});
+    alertText = `🚨 *[Jules Watchdog] Task Stuck (Needs Input)*\n• *Repo:* \`${event.repo || "Unknown"}\` | *ID:* \`${event.session_id}\` [${event.account || ""}]\n• *Title:* ${event.title || ""}\n• *Question:* _"${event.question || ""}"_\n👉 *Reply:* \`jules_reply_feedback(session_id='${event.session_id}', message='<answer>')\``;
   } else if (event.type === "pr_created") {
-    const msg = `🎉 *[Jules Watchdog] PR Created & Ready to Merge*\n• *Repo:* \`${event.repo || "Unknown"}\`\n• *Title:* ${event.title || ""}\n• *PR:* ${event.pr_url || ""}`;
-    sendTelegramAlert(msg).catch(() => {});
+    alertText = `🎉 *[Jules Watchdog] PR Created & Ready to Merge*\n• *Repo:* \`${event.repo || "Unknown"}\`\n• *Title:* ${event.title || ""}\n• *PR:* ${event.pr_url || ""}`;
   } else if (event.type === "task_failed") {
-    const msg = `❌ *[Jules Watchdog] Task Failed*\n• *Repo:* \`${event.repo || "Unknown"}\` | *ID:* \`${event.session_id}\`\n• *Reason:* ${event.error || "Unknown"}`;
-    sendTelegramAlert(msg).catch(() => {});
+    alertText = `❌ *[Jules Watchdog] Task Failed*\n• *Repo:* \`${event.repo || "Unknown"}\` | *ID:* \`${event.session_id}\`\n• *Reason:* ${event.error || "Unknown"}`;
+  }
+
+  if (alertText) {
+    // 1. Dynamic Hermes Platform Bridge (auto-routes to active chat on Telegram, Discord, Slack, etc.)
+    try {
+      const platform = process.env.HERMES_SESSION_PLATFORM || "telegram";
+      execSync(`hermes send --to ${platform} ${JSON.stringify(alertText)} 2>/dev/null`);
+    } catch {
+      // Fallback to direct Telegram API if hermes CLI is not available
+      sendTelegramAlert(alertText).catch(() => {});
+    }
   }
 
   const webhookUrl = process.env.JULES_WEBHOOK_URL;
