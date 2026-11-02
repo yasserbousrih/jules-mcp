@@ -1172,8 +1172,20 @@ function safeSendLoggingMessage(params: any): void {
 }
 
 async function sendTelegramAlert(text: string): Promise<void> {
-  const token = process.env.JULES_TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.JULES_TELEGRAM_CHAT_ID;
+  let token = process.env.JULES_TELEGRAM_BOT_TOKEN;
+  let chatId = process.env.JULES_TELEGRAM_CHAT_ID;
+
+  if (!token || !chatId) {
+    try {
+      const cfgPath = path.join(JULES_DIR, "config.json");
+      if (fs.existsSync(cfgPath)) {
+        const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
+        if (!token) token = cfg.telegram_bot_token || cfg.telegramToken;
+        if (!chatId) chatId = cfg.telegram_chat_id || cfg.telegramChatId;
+      }
+    } catch {}
+  }
+
   if (!token || !chatId) return;
 
   try {
